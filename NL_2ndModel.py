@@ -522,40 +522,41 @@ def make_features_and_train(
     if len(hist) < 30:
         raise ValueError("Zu wenige Datenpunkte nach Preprocessing für das Modell.")
 
-    X_cols = ["Range","SlopeHigh","SlopeLow"]
-    for c in ["PCR_vol","PCR_oi","VOI_call","VOI_put","IV_skew_p_minus_c","VOL_tot","OI_tot"]:
-        if c in feat.columns:
-            X_cols.append(c)
+    # Base-Features
+    X_cols = ["Range", "SlopeHigh", "SlopeLow"]
 
-    # --- Targets definieren
+    # Optional: Options-/Exog-Features (falls vorhanden)
+    opt_cols = ["PCR_vol", "PCR_oi", "VOI_call", "VOI_put",
+                "IV_skew_p_minus_c", "VOL_tot", "OI_tot"]
+    X_cols += [c for c in opt_cols if c in feat.columns]
+
+    # --- Target definieren (nur historisch, kein Look-Ahead)
     hist["Target"] = (hist["FutureRet"] > threshold).astype(int)
 
-    X_hist = hist[X_cols].copy()
-    X_all  = feat[X_cols].copy()
+    # Imports lokal, damit Streamlit schneller startet
+    from sklearn.impute import SimpleImputer
+    from sklearn.pipeline import Pipeline
 
-    # Falls nur eine Klasse vorhanden
+    def make_pipe():
+        return Pipeline(steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("model", GradientBoostingClassifier(**model_params)),
+        ])
+
+    # --- Falls nur eine Klasse vorhanden: konstante Wahrscheinlichkeit
     if hist["Target"].nunique() < 2:
         feat["SignalProb"] = 0.5
 
     else:
-        from sklearn.impute import SimpleImputer
-        from sklearn.pipeline import Pipeline
-
-        def make_pipe():
-            return Pipeline(steps=[
-                ("imputer", SimpleImputer(strategy="median")),
-                ("scaler", StandardScaler()),
-                ("model", GradientBoostingClassifier(**model_params)),
-            ])
-
         if not walk_forward:
             pipe = make_pipe()
-            pipe.fit(X_hist.values, hist["Target"].values)
-            feat["SignalProb"] = pipe.predict_proba(X_all.values)[:, 1]
+            pipe.fit(hist[X_cols].values, hist["Target"].values)
+            feat["SignalProb"] = pipe.predict_proba(feat[X_cols].values)[:, 1]
 
         else:
             probs = np.full(len(feat), np.nan, dtype=float)
-            min_train = max(lookback + horizon + 10, 60)
+            min_train = max(int(wf_min_train), lookback + horizon + 10)
 
             for t in range(min_train, len(feat)):
                 train = feat.iloc[:t].dropna(subset=["FutureRet"]).copy()
@@ -569,42 +570,25 @@ def make_features_and_train(
                 pipe = make_pipe()
                 pipe.fit(train[X_cols].values, train["Target"].values)
 
-                probs[t] = pipe.predict_proba(
-                    feat[X_cols].iloc[[t]].values
-                )[0, 1]
+                probs[t] = pipe.predict_proba(feat[X_cols].iloc[[t]].values)[0, 1]
 
             feat["SignalProb"] = (
                 pd.Series(probs, index=feat.index)
                 .ffill()
                 .fillna(0.5)
             )
-    else:
-        probs = np.full(len(feat), np.nan, dtype=float)
-        min_train = max(int(wf_min_train), lookback + horizon + 10)
 
-        for t in range(min_train, len(feat)):
-            train = feat.iloc[:t].dropna(subset=["FutureRet"]).copy()
-            if len(train) < min_train:
-                continue
-            train["Target"] = (train["FutureRet"] > threshold).astype(int)
-            if train["Target"].nunique() < 2:
-                continue
-
-            scaler = StandardScaler().fit(train[X_cols].values)
-            model  = GradientBoostingClassifier(**model_params).fit(
-                scaler.transform(train[X_cols].values), train["Target"].values
-            )
-            probs[t] = model.predict_proba(
-                scaler.transform(feat[X_cols].iloc[[t]].values)
-            )[0,1]
-
-        feat["SignalProb"] = pd.Series(probs, index=feat.index).ffill().fillna(0.5)
-
+    # --- Backtest (pro Ticker separates Konto)
     feat_bt = feat.iloc[:-1].copy()
     df_bt, trades = backtest_next_open(
-        feat_bt, entry_prob, exit_prob, COMMISSION, SLIPPAGE_BPS,
-        init_capital, pos_frac, min_hold_days=int(min_hold_days), cooldown_days=int(cooldown_days)
+        feat_bt,
+        entry_prob, exit_prob,
+        COMMISSION, SLIPPAGE_BPS,
+        init_capital, pos_frac,
+        min_hold_days=int(min_hold_days),
+        cooldown_days=int(cooldown_days),
     )
+
     metrics = compute_performance(df_bt, trades, init_capital)
     return feat, df_bt, trades, metrics
 
