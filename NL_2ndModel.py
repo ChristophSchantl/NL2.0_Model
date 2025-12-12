@@ -1359,5 +1359,60 @@ if results:
             st.plotly_chart(fig_corr, use_container_width=True)
 
 
+            # ─────────────────────────────────────────────────────────────
+            # 📈 Portfolio (Equal-Weight) – Avg Return / Vol / Sharpe / DD
+            # ─────────────────────────────────────────────────────────────
+            st.markdown("### 📈 Portfolio – Equal-Weight Performance (Close-to-Close)")
+            
+            # Preise aus all_dfs sammeln
+            price_series = []
+            for tk, dfbt in all_dfs.items():
+                if isinstance(dfbt, pd.DataFrame) and "Close" in dfbt.columns and len(dfbt) >= 2:
+                    s = dfbt["Close"].copy()
+                    s.name = tk
+                    price_series.append(s)
+            
+            if len(price_series) < 2:
+                st.info("Portfolio-Analytics: Mindestens zwei Ticker mit Close-Daten nötig.")
+            else:
+                prices = pd.concat(price_series, axis=1, join="outer").sort_index().ffill()
+                rets = prices.pct_change()
+            
+                # Equal-Weight Portfolio Return (tägliches Rebalancing)
+                w = np.ones(rets.shape[1], dtype=float) / rets.shape[1]
+                port_ret = rets.mul(w, axis=1).sum(axis=1).dropna()
+            
+                # Kennzahlen
+                ann_return = (1.0 + port_ret.mean()) ** 252 - 1.0
+                ann_vol = port_ret.std(ddof=0) * np.sqrt(252)
+                sharpe = (port_ret.mean() / (port_ret.std(ddof=0) + 1e-12)) * np.sqrt(252)
+            
+                nav0 = float(INIT_CAP_PER_TICKER) * len(summary_df)
+                nav = nav0 * (1.0 + port_ret).cumprod()
+                dd = (nav / nav.cummax()) - 1.0
+                max_dd = float(dd.min())
+            
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Ø Return p.a.", f"{ann_return*100:.2f}%")
+                c2.metric("Vol p.a.", f"{ann_vol*100:.2f}%")
+                c3.metric("Sharpe", f"{sharpe:.2f}")
+                c4.metric("Max Drawdown", f"{max_dd*100:.2f}%")
+            
+                fig_nav = go.Figure()
+                fig_nav.add_trace(go.Scatter(x=nav.index, y=nav.values, mode="lines", name="Portfolio NAV"))
+                fig_nav.update_layout(height=380, title="Portfolio NAV (Equal-Weight, Close-to-Close)",
+                                      xaxis_title="Datum", yaxis_title="NAV (€)",
+                                      margin=dict(t=45, b=30, l=40, r=20))
+                st.plotly_chart(fig_nav, use_container_width=True)
+            
+                st.download_button(
+                    "Portfolio-Returns (daily) als CSV",
+                    to_csv_eu(pd.DataFrame({"Date": port_ret.index, "PortfolioRet": port_ret.values})),
+                    file_name="portfolio_returns_daily.csv",
+                    mime="text/csv",
+                )
+
+
+
 else:
     st.warning("Noch keine Ergebnisse verfügbar. Prüfe Ticker-Eingaben und Datenabdeckung.")
