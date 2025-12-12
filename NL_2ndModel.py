@@ -1,7 +1,7 @@
 # streamlit_app.py
 # ─────────────────────────────────────────────────────────────
 # PROTEUS – Signal-basierte Strategie (Full Version)
-# (A) pro Ticker separates Konto + Bugfix: DatetimeIndex.sort_index
+# (A) pro Ticker separates Konto + Fix: Phase-Style ("Open" blau)
 # ─────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────
@@ -25,7 +25,6 @@ from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
-
 
 import plotly.graph_objects as go
 import plotly.express as px
@@ -163,7 +162,12 @@ st.sidebar.markdown("**Modellparameter**")
 n_estimators  = st.sidebar.number_input("n_estimators",  10, 500, 100, step=10)
 learning_rate = st.sidebar.number_input("learning_rate", 0.01, 1.0, 0.1, step=0.01, format="%.2f")
 max_depth     = st.sidebar.number_input("max_depth",     1, 10, 3, step=1)
-MODEL_PARAMS = dict(n_estimators=int(n_estimators), learning_rate=float(learning_rate), max_depth=int(max_depth), random_state=42)
+MODEL_PARAMS = dict(
+    n_estimators=int(n_estimators),
+    learning_rate=float(learning_rate),
+    max_depth=int(max_depth),
+    random_state=42
+)
 
 # Walk-forward/OOS
 st.sidebar.markdown("**OOS / Walk-Forward**")
@@ -190,12 +194,13 @@ if c2.button("↻ Rerun"):
 # Misc Helpers
 # ─────────────────────────────────────────────────────────────
 def show_styled_or_plain(df: pd.DataFrame, styler):
+    """
+    Robustes Rendering:
+    - bevorzugt HTML-Styler (damit Farben zuverlässig sind)
+    - Fallback nur wenn Styler wirklich scheitert
+    """
     try:
-        html = getattr(styler, "to_html", None)
-        if callable(html):
-            st.markdown(html(), unsafe_allow_html=True)
-        else:
-            raise AttributeError("Styler ohne to_html()")
+        st.markdown(styler.to_html(), unsafe_allow_html=True)
     except Exception as e:
         st.warning(f"Styled-Tabelle nicht renderbar, fallback auf DataFrame. ({e})")
         st.dataframe(df, use_container_width=True)
@@ -258,7 +263,7 @@ def style_live_board(df: pd.DataFrame, prob_col: str, entry_threshold: float):
 
 
 # ─────────────────────────────────────────────────────────────
-# Data Loading (BUGFIX: keine sort_index() auf DatetimeIndex)
+# Data Loading
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=180)
 def get_price_data_tail_intraday(
@@ -326,7 +331,6 @@ def get_price_data_tail_intraday(
             "Volume": float(intraday["Volume"].sum()) if "Volume" in intraday.columns else np.nan,
         }
 
-        # Overwrite/append safe:
         if day_key in df.index:
             for k, v in daily_row.items():
                 df.loc[day_key, k] = v
@@ -350,7 +354,7 @@ def get_intraday_last_n_sessions(ticker: str, sessions: int = 5, days_buffer: in
     if intr.index.tz is None:
         intr.index = intr.index.tz_localize("UTC")
     intr.index = intr.index.tz_convert(LOCAL_TZ)
-    intr = intr.sort_index()  # FIX
+    intr = intr.sort_index()
     unique_dates = pd.Index(intr.index.normalize().unique())
     keep_dates = set(unique_dates[-sessions:])
     mask = intr.index.normalize().isin(keep_dates)
@@ -522,20 +526,12 @@ def make_features_and_train(
     if len(hist) < 30:
         raise ValueError("Zu wenige Datenpunkte nach Preprocessing für das Modell.")
 
-    # Base-Features
     X_cols = ["Range", "SlopeHigh", "SlopeLow"]
-
-    # Optional: Options-/Exog-Features (falls vorhanden)
     opt_cols = ["PCR_vol", "PCR_oi", "VOI_call", "VOI_put",
                 "IV_skew_p_minus_c", "VOL_tot", "OI_tot"]
     X_cols += [c for c in opt_cols if c in feat.columns]
 
-    # --- Target definieren (nur historisch, kein Look-Ahead)
     hist["Target"] = (hist["FutureRet"] > threshold).astype(int)
-
-    # Imports lokal, damit Streamlit schneller startet
-    from sklearn.impute import SimpleImputer
-    from sklearn.pipeline import Pipeline
 
     def make_pipe():
         return Pipeline(steps=[
@@ -544,16 +540,13 @@ def make_features_and_train(
             ("model", GradientBoostingClassifier(**model_params)),
         ])
 
-    # --- Falls nur eine Klasse vorhanden: konstante Wahrscheinlichkeit
     if hist["Target"].nunique() < 2:
         feat["SignalProb"] = 0.5
-
     else:
         if not walk_forward:
             pipe = make_pipe()
             pipe.fit(hist[X_cols].values, hist["Target"].values)
             feat["SignalProb"] = pipe.predict_proba(feat[X_cols].values)[:, 1]
-
         else:
             probs = np.full(len(feat), np.nan, dtype=float)
             min_train = max(int(wf_min_train), lookback + horizon + 10)
@@ -562,23 +555,16 @@ def make_features_and_train(
                 train = feat.iloc[:t].dropna(subset=["FutureRet"]).copy()
                 if len(train) < min_train:
                     continue
-
                 train["Target"] = (train["FutureRet"] > threshold).astype(int)
                 if train["Target"].nunique() < 2:
                     continue
 
                 pipe = make_pipe()
                 pipe.fit(train[X_cols].values, train["Target"].values)
-
                 probs[t] = pipe.predict_proba(feat[X_cols].iloc[[t]].values)[0, 1]
 
-            feat["SignalProb"] = (
-                pd.Series(probs, index=feat.index)
-                .ffill()
-                .fillna(0.5)
-            )
+            feat["SignalProb"] = pd.Series(probs, index=feat.index).ffill().fillna(0.5)
 
-    # --- Backtest (pro Ticker separates Konto)
     feat_bt = feat.iloc[:-1].copy()
     df_bt, trades = backtest_next_open(
         feat_bt,
@@ -588,7 +574,6 @@ def make_features_and_train(
         min_hold_days=int(min_hold_days),
         cooldown_days=int(cooldown_days),
     )
-
     metrics = compute_performance(df_bt, trades, init_capital)
     return feat, df_bt, trades, metrics
 
@@ -639,7 +624,6 @@ def backtest_next_open(
                 bars_since_exit = i - last_exit_idx
                 cool_ok = bars_since_exit >= int(cooldown_days)
 
-            # ENTRY
             can_enter = (not in_pos) and (prob_prev > entry_thr) and cool_ok
             if can_enter:
                 invest_net   = cash_net * float(pos_frac)
@@ -662,7 +646,6 @@ def backtest_next_open(
                         "HoldDays": np.nan
                     })
 
-            # EXIT
             elif in_pos and prob_prev < exit_thr:
                 held_bars = (i - last_entry_idx) if last_entry_idx is not None else 0
                 if int(min_hold_days) > 0 and held_bars < int(min_hold_days):
@@ -950,7 +933,6 @@ price_map, meta_map = load_all_prices(
     use_live, intraday_interval, fallback_last_session, exec_mode, int(moc_cutoff_min)
 )
 
-# Options-Aggregate
 options_live: Dict[str, pd.DataFrame] = {}
 if use_chain_live:
     st.info("Optionsketten je Aktie einlesen …")
@@ -1033,7 +1015,6 @@ for ticker in TICKERS:
 
             live_forecasts_run.append(row)
 
-            # KPI Tiles
             c1, c2, c3, c4, c5, c6 = st.columns(6)
             c1.metric("Strategie Netto (%)", f"{metrics['Strategy Net (%)']:.2f}")
             c2.metric("Buy & Hold (%)",      f"{metrics['Buy & Hold Net (%)']:.2f}")
@@ -1047,10 +1028,8 @@ for ticker in TICKERS:
                 f"| Target: FutureRet > {THRESH:.3f} (in {HORIZON}d)"
             )
 
-            # Charts
             chart_cols = st.columns(2)
 
-            # Preis + Signale
             df_plot = feat.copy()
             price_fig = go.Figure()
             price_fig.add_trace(go.Scatter(
@@ -1089,7 +1068,6 @@ for ticker in TICKERS:
             with chart_cols[0]:
                 st.plotly_chart(price_fig, use_container_width=True)
 
-            # Intraday (letzte 5 Handelstage)
             intra = get_intraday_last_n_sessions(ticker, sessions=5, days_buffer=10, interval=intraday_interval)
             with chart_cols[1]:
                 if intra.empty:
@@ -1116,7 +1094,6 @@ for ticker in TICKERS:
                     )
                     st.plotly_chart(intr_fig, use_container_width=True)
 
-            # Equity-Kurve
             eq = go.Figure()
             eq.add_trace(go.Scatter(x=df_bt.index, y=df_bt["Equity_Net"], name="Strategy Net Equity (Next Open)",
                         mode="lines", hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}€<extra></extra>"))
@@ -1128,7 +1105,6 @@ for ticker in TICKERS:
                              legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
             st.plotly_chart(eq, use_container_width=True)
 
-            # Trades-Tabelle
             with st.expander(f"Trades (Next Open) für {ticker}", expanded=False):
                 trades_df = pd.DataFrame(trades)
                 if not trades_df.empty:
@@ -1145,13 +1121,13 @@ for ticker in TICKERS:
 
                     disp_cols = ["Ticker","Name","DateStr","Typ","Price","Shares",
                                  "Signal Prob","Hold (days)","PnL","CumPnL","Fees"]
-                    styled = (
+                    styled_tr = (
                         df_tr[disp_cols].rename(columns={"DateStr":"Date"}).style.format({
                             "Price":"{:.2f}","Shares":"{:.4f}","Signal Prob":"{:.4f}",
                             "PnL":"{:.2f}","CumPnL":"{:.2f}","Fees":"{:.2f}"
                         })
                     )
-                    show_styled_or_plain(df_tr[disp_cols].rename(columns={"DateStr":"Date"}), styled)
+                    show_styled_or_plain(df_tr[disp_cols].rename(columns={"DateStr":"Date"}), styled_tr)
 
                     st.download_button(
                         label=f"Trades {ticker} als CSV",
@@ -1190,38 +1166,9 @@ if live_forecasts_run:
         if cand:
             prob_col = cand[0]
 
-    if use_chain_live:
-        for c in ["PCR_oi","PCR_vol","VOI_call","VOI_put"]:
-            if c in live_df.columns:
-                s = pd.to_numeric(live_df[c], errors="coerce")
-                live_df[c] = s
-                live_df[c+"_z"] = (s - s.mean()) / (s.std(ddof=0) + 1e-9)
-
-        def col_or_zero(name: str) -> pd.Series:
-            return (pd.to_numeric(live_df[name], errors="coerce")
-                    if name in live_df.columns else pd.Series(0.0, index=live_df.index))
-
-        comp = (
-            -0.6 * col_or_zero("PCR_oi_z").fillna(0.0)
-            -0.3 * col_or_zero("PCR_vol_z").fillna(0.0)
-            +0.5 * (col_or_zero("VOI_call_z").fillna(0.0) - col_or_zero("VOI_put_z").fillna(0.0))
-        )
-        p_base = pd.to_numeric(live_df[prob_col], errors="coerce").fillna(0.0)
-        live_df["P_adj"] = np.clip(p_base + 0.07 * comp, 0.0, 1.0)
-        live_df["Action_adj"] = live_df["P_adj"].apply(
-            lambda p: "Enter / Add" if p >= ENTRY_PROB else ("Exit / Reduce" if p <= EXIT_PROB else "Hold / No Trade")
-        )
-
-        desired = ["AsOf","Ticker","Name",prob_col,"P_adj","Action","Action_adj",
-                   "PCR_oi","PCR_vol","VOI_call","VOI_put","Close","Target_5d","Bar"]
-        show_cols = [c for c in desired if c in live_df.columns]
-    else:
-        desired = ["AsOf","Ticker","Name",prob_col,"Action","Close","Target_5d","Bar"]
-        show_cols = [c for c in desired if c in live_df.columns]
-
     st.markdown(f"### 🟣 Live–Forecast Board – {HORIZON}-Tage Prognose (heute)")
-    styled_live = style_live_board(live_df[show_cols], prob_col, ENTRY_PROB)
-    show_styled_or_plain(live_df[show_cols], styled_live)
+    styled_live = style_live_board(live_df, prob_col, ENTRY_PROB)
+    show_styled_or_plain(live_df, styled_live)
 
     st.download_button(
         "Live-Forecasts als CSV",
@@ -1235,6 +1182,18 @@ if live_forecasts_run:
 # ─────────────────────────────────────────────────────────────
 if results:
     summary_df = pd.DataFrame(results).set_index("Ticker")
+
+    # ✅ FIX 1: Phase normalisieren (damit Styling sicher trifft)
+    if "Phase" in summary_df.columns:
+        summary_df["Phase"] = (
+            summary_df["Phase"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .replace({"nan": ""})
+            .map(lambda x: "Open" if x == "open" else ("Flat" if x == "flat" else x.capitalize()))
+        )
+
     summary_df["Net P&L (%)"] = (summary_df["Net P&L (€)"] / float(INIT_CAP_PER_TICKER)) * 100
 
     total_net_pnl   = float(summary_df["Net P&L (€)"].sum())
@@ -1260,7 +1219,16 @@ if results:
     cols_pct[2].metric("Buy & Hold Net (%) – total", f"{bh_total_pct:.2f}")
     cols_pct[3].metric("Durchschn. CAGR (%)", f"{summary_df['CAGR (%)'].dropna().mean():.2f}" if "CAGR (%)" in summary_df else "–")
 
-    styled = (
+    # ✅ FIX 2: Phase Styling (Open blau)
+    def phase_style(val):
+        v = str(val).strip().lower()
+        if v == "open":
+            return "background-color:#d0ebff; color:#1f77b4; font-weight:800;"
+        if v == "flat":
+            return "background-color:#f0f0f0; color:#666;"
+        return ""
+
+    styled_sum = (
         summary_df.style
         .format({
             "Strategy Net (%)":"{:.2f}","Strategy Gross (%)":"{:.2f}",
@@ -1273,7 +1241,12 @@ if results:
         })
         .set_caption("Strategy-Performance per Ticker (Next Open Execution)")
     )
-    show_styled_or_plain(summary_df, styled)
+
+    if "Phase" in summary_df.columns:
+        styled_sum = styled_sum.applymap(phase_style, subset=["Phase"])
+
+    # ✅ FIX 3: immer HTML rendern (kein st.dataframe-Fallback → Farben bleiben)
+    show_styled_or_plain(summary_df, styled_sum)
 
     st.download_button(
         "Summary als CSV herunterladen",
@@ -1308,7 +1281,6 @@ if results:
     else:
         st.success("Keine offenen Positionen.")
 
-    # Round-Trips + Histogramme
     rt_df = compute_round_trips(all_trades)
     if not rt_df.empty:
         st.subheader("🔁 Abgeschlossene Trades (Round-Trips)")
@@ -1339,7 +1311,6 @@ if results:
                 fig_pnl.update_layout(title="Histogramm: PnL Net (€)", height=360, showlegend=False)
                 st.plotly_chart(fig_pnl, use_container_width=True)
 
-    # Korrelation
     st.markdown("### 🔗 Portfolio-Korrelation (Close-Returns)")
     price_series = []
     for tk, dfbt in all_dfs.items():
