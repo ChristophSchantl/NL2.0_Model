@@ -1311,23 +1311,53 @@ if results:
                 fig_pnl.update_layout(title="Histogramm: PnL Net (€)", height=360, showlegend=False)
                 st.plotly_chart(fig_pnl, use_container_width=True)
 
-    st.markdown("### 🔗 Portfolio-Korrelation (Close-Returns)")
-    price_series = []
-    for tk, dfbt in all_dfs.items():
-        if isinstance(dfbt, pd.DataFrame) and "Close" in dfbt.columns and len(dfbt) >= 2:
-            s = dfbt["Close"].copy()
-            s.name = tk
-            price_series.append(s)
+        # Korrelation
+        st.markdown("### 🔗 Portfolio-Korrelation (Close-Returns)")
+        price_series = []
+        for tk, dfbt in all_dfs.items():
+            if isinstance(dfbt, pd.DataFrame) and "Close" in dfbt.columns and len(dfbt) >= 2:
+                s = dfbt["Close"].copy()
+                s.name = tk
+                price_series.append(s)
+        
+        if len(price_series) < 2:
+            st.info("Mindestens zwei Ticker mit Daten nötig.")
+        else:
+            prices = pd.concat(price_series, axis=1, join="outer").sort_index().ffill()
+            rets = prices.pct_change().dropna(how="all")
+            corr = rets.corr(method="pearson")
+        
+            fig_corr = px.imshow(
+                corr,
+                text_auto=".2f",
+                aspect="auto",
+                color_continuous_scale="RdBu",
+                zmin=-1, zmax=1
+            )
+        
+            # ✅ Labels NICHT automatisch ausdünnen
+            fig_corr.update_xaxes(
+                tickmode="array",
+                tickvals=list(range(len(corr.columns))),
+                ticktext=list(corr.columns),
+                tickangle=45,
+                automargin=True
+            )
+            fig_corr.update_yaxes(
+                tickmode="array",
+                tickvals=list(range(len(corr.index))),
+                ticktext=list(corr.index),
+                automargin=True
+            )
+        
+            fig_corr.update_layout(
+                height=650,
+                margin=dict(t=40, l=80, r=30, b=120),
+                coloraxis_colorbar=dict(title="ρ")
+            )
+        
+            st.plotly_chart(fig_corr, use_container_width=True)
 
-    if len(price_series) < 2:
-        st.info("Mindestens zwei Ticker mit Daten nötig.")
-    else:
-        prices = pd.concat(price_series, axis=1, join="outer").sort_index().ffill()
-        rets = prices.pct_change().dropna(how="all")
-        corr = rets.corr(method="pearson")
-        fig_corr = px.imshow(corr, text_auto=".2f", aspect="auto", color_continuous_scale="RdBu", zmin=-1, zmax=1)
-        fig_corr.update_layout(height=520, margin=dict(t=40, l=40, r=30, b=40), coloraxis_colorbar=dict(title="ρ"))
-        st.plotly_chart(fig_corr, use_container_width=True)
 
 else:
     st.warning("Noch keine Ergebnisse verfügbar. Prüfe Ticker-Eingaben und Datenabdeckung.")
