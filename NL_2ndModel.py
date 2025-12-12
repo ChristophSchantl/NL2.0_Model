@@ -23,6 +23,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+
 
 import plotly.graph_objects as go
 import plotly.express as px
@@ -524,18 +527,57 @@ def make_features_and_train(
         if c in feat.columns:
             X_cols.append(c)
 
-    if not walk_forward:
-        hist["Target"] = (hist["FutureRet"] > threshold).astype(int)
-        if hist["Target"].nunique() < 2:
-            feat["SignalProb"] = 0.5
+    # --- Targets definieren
+    hist["Target"] = (hist["FutureRet"] > threshold).astype(int)
+
+    X_hist = hist[X_cols].copy()
+    X_all  = feat[X_cols].copy()
+
+    # Falls nur eine Klasse vorhanden
+    if hist["Target"].nunique() < 2:
+        feat["SignalProb"] = 0.5
+
+    else:
+        from sklearn.impute import SimpleImputer
+        from sklearn.pipeline import Pipeline
+
+        def make_pipe():
+            return Pipeline(steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+                ("model", GradientBoostingClassifier(**model_params)),
+            ])
+
+        if not walk_forward:
+            pipe = make_pipe()
+            pipe.fit(X_hist.values, hist["Target"].values)
+            feat["SignalProb"] = pipe.predict_proba(X_all.values)[:, 1]
+
         else:
-            scaler = StandardScaler().fit(hist[X_cols].values)
-            model  = GradientBoostingClassifier(**model_params).fit(
-                scaler.transform(hist[X_cols].values), hist["Target"].values
+            probs = np.full(len(feat), np.nan, dtype=float)
+            min_train = max(lookback + horizon + 10, 60)
+
+            for t in range(min_train, len(feat)):
+                train = feat.iloc[:t].dropna(subset=["FutureRet"]).copy()
+                if len(train) < min_train:
+                    continue
+
+                train["Target"] = (train["FutureRet"] > threshold).astype(int)
+                if train["Target"].nunique() < 2:
+                    continue
+
+                pipe = make_pipe()
+                pipe.fit(train[X_cols].values, train["Target"].values)
+
+                probs[t] = pipe.predict_proba(
+                    feat[X_cols].iloc[[t]].values
+                )[0, 1]
+
+            feat["SignalProb"] = (
+                pd.Series(probs, index=feat.index)
+                .ffill()
+                .fillna(0.5)
             )
-            feat["SignalProb"] = model.predict_proba(
-                scaler.transform(feat[X_cols].values)
-            )[:,1]
     else:
         probs = np.full(len(feat), np.nan, dtype=float)
         min_train = max(int(wf_min_train), lookback + horizon + 10)
