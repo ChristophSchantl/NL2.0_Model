@@ -812,6 +812,23 @@ def compute_round_trips(all_trades: Dict[str, List[dict]]) -> pd.DataFrame:
                 current_entry = None
     return pd.DataFrame(rows)
 
+def get_portfolio_nav_from_backtest(
+    all_dfs: Dict[str, pd.DataFrame],
+    init_cap_per_ticker: float
+) -> float:
+    """
+    Echter Portfolio-NAV aus dem Backtest:
+    Summe der letzten Equity_Net je Ticker.
+    """
+    nav = 0.0
+    for tk, dfbt in (all_dfs or {}).items():
+        if isinstance(dfbt, pd.DataFrame) and "Equity_Net" in dfbt.columns and len(dfbt) > 0:
+            nav += float(dfbt["Equity_Net"].iloc[-1])
+        else:
+            nav += float(init_cap_per_ticker)
+    return float(nav)
+
+
 
 # ─────────────────────────────────────────────────────────────
 # ✅ Forecast Helpers (Backtest-basiert)
@@ -1441,7 +1458,13 @@ if results:
                 ann_vol = port_ret.std(ddof=0) * np.sqrt(252)
                 sharpe = (port_ret.mean() / (port_ret.std(ddof=0) + 1e-12)) * np.sqrt(252)
 
-                nav0 = float(INIT_CAP_PER_TICKER) * len(summary_df)
+                nav0 = get_portfolio_nav_from_backtest(
+                    all_dfs,
+                    float(INIT_CAP_PER_TICKER)
+                )
+
+                st.caption(f"Forecast-NAV Basis (aus Backtest): {nav0:,.2f} €")
+                
                 nav = nav0 * (1.0 + port_ret).cumprod()
                 dd = (nav / nav.cummax()) - 1.0
                 max_dd = float(dd.min())
