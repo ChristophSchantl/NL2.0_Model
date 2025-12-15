@@ -967,47 +967,58 @@ with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=Fa
             )
             if feat is None or hist is None or hist["Target"].nunique() < 2:
                 raise ValueError("Feature cache leer / Target degeneriert")
-
+        
             X_cols = ["Range", "SlopeHigh", "SlopeLow"]
-
+        
             pipe = Pipeline([
                 ("imputer", SimpleImputer(strategy="median")),
                 ("model", GradientBoostingClassifier(**MODEL_PARAMS)),
             ])
-
-            mid = len(hist) // 2
-            sharps = []
-            trades_sum = 0
-            valid_parts = 0
-
-            for sub in (hist.iloc[:mid], hist.iloc[mid:]):
-                if len(sub) < int(wf_min_train):
-                    continue
-
-                pipe.fit(sub[X_cols], sub["Target"])
-                feat["SignalProb"] = pipe.predict_proba(feat[X_cols])[:, 1]
-
-                df_bt, trades = backtest_next_open(
-                    feat.iloc[:-1],
-                    float(p["entry"]), float(p["exit"]),
-                    COMMISSION, SLIPPAGE_BPS,
-                    float(INIT_CAP_PER_TICKER),
-                    float(POS_FRAC),
-                    min_hold_days=int(MIN_HOLD_DAYS),
-                    cooldown_days=int(COOLDOWN_DAYS),
-                )
-
-                mets = compute_performance(df_bt, trades, float(INIT_CAP_PER_TICKER))
-                s = mets.get("Sharpe-Ratio", np.nan)
-                if np.isfinite(s):
-                    sharps.append(float(s))
-                    valid_parts += 1
-                trades_sum += int(mets.get("Number of Trades", 0))
-
-            if valid_parts == 0 or not sharps:
+        
+            # --- 1-Split Walk-Forward light ---
+            n = len(hist)
+            min_train = int(wf_min_train)
+        
+            # train = max(min_train, 60% der Historie), test = Rest
+            split = max(min_train, int(0.6 * n))
+            if n - split < 30:
+                raise ValueError("Keine gültigen Sharpe-Werte")  # OOS zu kurz
+        
+            train = hist.iloc[:split].copy()
+            test_idx = hist.index[split:]  # OOS Index
+        
+            if train["Target"].nunique() < 2:
+                raise ValueError("Feature cache leer / Target degeneriert")
+        
+            pipe.fit(train[X_cols].values, train["Target"].values)
+        
+            # Probas für gesamten Zeitraum, aber Performance NUR auf OOS messen
+            feat["SignalProb"] = pipe.predict_proba(feat[X_cols].values)[:, 1]
+        
+            df_bt, trades = backtest_next_open(
+                feat.iloc[:-1],
+                float(p["entry"]), float(p["exit"]),
+                COMMISSION, SLIPPAGE_BPS,
+                float(INIT_CAP_PER_TICKER),
+                float(POS_FRAC),
+                min_hold_days=int(MIN_HOLD_DAYS),
+                cooldown_days=int(COOLDOWN_DAYS),
+            )
+        
+            # OOS-Performance slice
+            df_oos = df_bt.loc[df_bt.index.intersection(test_idx)]
+            if len(df_oos) < 30:
                 raise ValueError("Keine gültigen Sharpe-Werte")
+        
+            rets = df_oos["Equity_Net"].pct_change().dropna()
+            if rets.empty:
+                raise ValueError("Keine gültigen Sharpe-Werte")
+        
+            sharpe_oos = float((rets.mean() / (rets.std(ddof=0) + 1e-12)) * np.sqrt(252))
+            trades_total = int(sum(1 for t in trades if t["Typ"] == "Exit"))
+        
+            return sharpe_oos, trades_total, 1
 
-            return float(np.median(sharps)), int(trades_sum), int(valid_parts)
 
         rows = []
         best = None
