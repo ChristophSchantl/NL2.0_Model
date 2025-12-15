@@ -1,6 +1,6 @@
 # streamlit_app.py
 # ─────────────────────────────────────────────────────────────
-# PROTEUS – Signal-basierte Strategie (Full Version)
+# NEW LEVEL 2nd Model – Signal-basierte Strategie (Full Version)
 # pro Ticker separates Konto + robuste Loader + saubere Fixes
 # - Loader: as_completed (korrekte Future→Ticker Zuordnung)
 # - Target: FutureRetExec passend zu "Next Open"
@@ -32,7 +32,7 @@ from sklearn.pipeline import Pipeline
 import plotly.graph_objects as go
 import plotly.express as px
 
-st.set_page_config(page_title="SHI – STOCK CHECK / PROTEUS", layout="wide")
+st.set_page_config(page_title="NEW LEVEL 2ND MODEL", layout="wide")
 LOCAL_TZ = ZoneInfo("Europe/Zurich")
 MAX_WORKERS = 6  # yfinance rate-limit sensibel: ggf. 2-4
 pd.options.display.float_format = "{:,.4f}".format
