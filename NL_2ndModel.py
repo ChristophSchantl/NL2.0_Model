@@ -919,98 +919,163 @@ with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=Fa
 
     if st.button("🔎 Suche starten", type="primary", use_container_width=True):
         import random
+        from collections import Counter
+    
         rng = random.Random(int(seed))
         price_map_opt = _get_prices_for_optimizer(
             tuple(TICKERS), str(START_DATE), str(END_DATE),
             use_live, intraday_interval, fallback_last_session, exec_mode, int(moc_cutoff_min)
         )
-
-        rows, best = [], None
-        prog = st.progress(0.0)
-
-        feasible_tickers = [tk for tk, df in price_map_opt.items() if df is not None and len(df) >= 80]
+    
+        feasible_tickers = [tk for tk, df in price_map_opt.items() if isinstance(df, pd.DataFrame) and len(df) >= 80]
         if not feasible_tickers:
             st.warning("Keine ausreichenden Preisdaten für Optimierung.")
+            st.stop()
+    
+        def _eval_one(df0: pd.DataFrame, p: dict) -> tuple:
+            # dynamisch: WalkForward braucht schlicht mehr Bars
+            wf_need = max(int(wf_min_train), int(p["lookback"]) + int(p["horizon"]) + 30)
+            if len(df0) < wf_need + 10:
+                raise ValueError(f"Zu wenig Daten: need~{wf_need}, have={len(df0)}")
+    
+            # 2-Hälften WalkForward-Light
+            mid = len(df0) // 2
+            parts = [df0.iloc[:mid], df0.iloc[mid:]]
+            sharps = []
+            trades_sum = 0
+            valid_parts = 0
+    
+            for sub in parts:
+                wf_need_sub = max(int(wf_min_train), int(p["lookback"]) + int(p["horizon"]) + 30)
+                if len(sub) < wf_need_sub + 10:
+                    continue
+    
+                _, _, _, mets = make_features_and_train(
+                    sub, int(p["lookback"]), int(p["horizon"]), float(p["thresh"]),
+                    MODEL_PARAMS, float(p["entry"]), float(p["exit"]),
+                    init_capital=float(INIT_CAP_PER_TICKER),
+                    pos_frac=float(POS_FRAC),
+                    min_hold_days=int(MIN_HOLD_DAYS),
+                    cooldown_days=int(COOLDOWN_DAYS),
+                    walk_forward=True,
+                    wf_min_train=int(wf_min_train),
+                )
+                s = mets.get("Sharpe-Ratio", np.nan)
+                t = mets.get("Number of Trades", 0)
+                if np.isfinite(s):
+                    sharps.append(float(s))
+                    valid_parts += 1
+                trades_sum += int(t) if pd.notna(t) else 0
+    
+            if valid_parts == 0 or len(sharps) == 0:
+                raise ValueError("Keine gültigen OOS-Hälften (Sharpe/Trades leer).")
+    
+            return float(np.nanmedian(sharps)), int(trades_sum), int(valid_parts)
+    
+        def _sample_params(rng):
+            return dict(
+                lookback = rng.randrange(lb_lo, lb_hi + 1, 5),
+                horizon  = rng.randrange(hz_lo, hz_hi + 1, 1),
+                thresh   = rng.uniform(thr_lo, thr_hi),
+                entry    = rng.uniform(en_lo, en_hi),
+                exit     = rng.uniform(ex_lo, ex_hi),
+            )
+    
+        rows = []
+        best = None
+        prog = st.progress(0.0)
+        err_counter = Counter()
+        valid_trials = 0
+    
+        for t in range(int(n_trials)):
+            p = _sample_params(rng)
+            if p["exit"] >= p["entry"]:
+                prog.progress((t + 1) / int(n_trials))
+                continue
+    
+            sharps_all = []
+            trades_total = 0
+            valid_parts_total = 0
+            ok_tickers = 0
+    
+            for tk in feasible_tickers:
+                df0 = price_map_opt.get(tk)
+                if df0 is None or len(df0) < max(80, int(p["lookback"]) + int(p["horizon"]) + 40):
+                    continue
+                try:
+                    s_med, tr_sum, vparts = _eval_one(df0, p)
+                    sharps_all.append(s_med)
+                    trades_total += tr_sum
+                    valid_parts_total += vparts
+                    ok_tickers += 1
+                except Exception as e:
+                    err_counter[str(e)[:90]] += 1
+    
+            # Mindestens 2 Ticker erfolgreich, sonst ist’s statistisch Müll
+            if ok_tickers < 2 or len(sharps_all) == 0:
+                prog.progress((t + 1) / int(n_trials))
+                continue
+    
+            sharpe_med = float(np.nanmedian(sharps_all))
+            if not np.isfinite(sharpe_med):
+                prog.progress((t + 1) / int(n_trials))
+                continue
+    
+            # Trades-Filter: wir nehmen echte completed Trades Summe,
+            # aber skalieren sinnvoll (pro gültigem Ticker & pro Teilfenster)
+            denom = max(1, ok_tickers * max(1, valid_parts_total))
+            trades_scaled = trades_total / denom
+    
+            if trades_total < int(min_trades_req):
+                prog.progress((t + 1) / int(n_trials))
+                continue
+    
+            score = sharpe_med - float(lambda_trades) * float(trades_scaled)
+    
+            rec = dict(
+                trial=t,
+                score=float(score),
+                sharpe_med=float(sharpe_med),
+                trades=int(trades_total),
+                trades_scaled=float(trades_scaled),
+                ok_tickers=int(ok_tickers),
+                **p
+            )
+            rows.append(rec)
+            valid_trials += 1
+            if (best is None) or (rec["score"] > best["score"]):
+                best = rec
+    
+            prog.progress((t + 1) / int(n_trials))
+    
+        if not rows:
+            st.error("Keine gültigen Kandidaten gefunden – Debug unten.")
+            if err_counter:
+                st.caption("Häufigste Fehler (Top 10):")
+                st.write(pd.DataFrame(err_counter.most_common(10), columns=["Error", "Count"]))
+            st.info(
+                "Schnelle Fixes: "
+                "1) wf_min_train senken (z.B. 60–90), "
+                "2) Lookback/Horizon kleiner, "
+                "3) min_trades_req auf 0–2, "
+                "4) Exit-Range enger unter Entry-Range halten."
+            )
         else:
-            for t in range(int(n_trials)):
-                p = _sample_params(rng)
-                if p["exit"] >= p["entry"]:
-                    prog.progress((t+1)/n_trials)
-                    continue
+            df_res = pd.DataFrame(rows).sort_values("score", ascending=False)
+            st.success(f"Valid Trials: {valid_trials}/{int(n_trials)} | Beste Score={best['score']:.3f} | Sharpe(med)={best['sharpe_med']:.2f} | Trades={best['trades']}")
+            c1_, c2_, c3_, c4_, c5_ = st.columns(5)
+            c1_.metric("Lookback", int(best["lookback"]))
+            c2_.metric("Horizon",  int(best["horizon"]))
+            c3_.metric("Target Thresh", f"{best['thresh']:.3f}")
+            c4_.metric("Entry Prob",    f"{best['entry']:.2f}")
+            c5_.metric("Exit Prob",     f"{best['exit']:.2f}")
+    
+            st.caption("Top-Ergebnisse (Score = Sharpe_med − λ·Trades_scaled)")
+            st.dataframe(df_res.head(25), use_container_width=True)
+            st.download_button("Optimierergebnisse als CSV",
+                               to_csv_eu(df_res),
+                               file_name="param_search_results.csv", mime="text/csv")
 
-                sharps, trades_total, feasible = [], 0, 0
-
-                for tk in feasible_tickers:
-                    df0 = price_map_opt.get(tk)
-                    if df0 is None or len(df0) < max(60, p["lookback"] + p["horizon"] + 5):
-                        continue
-                    feasible += 1
-
-                    mid = len(df0) // 2
-                    for sub in (df0.iloc[:mid], df0.iloc[mid:]):
-                        if len(sub) < max(60, p["lookback"] + p["horizon"] + 5):
-                            continue
-                        try:
-                            _, df_bt, trades, mets = make_features_and_train(
-                                sub, p["lookback"], p["horizon"], p["thresh"],
-                                MODEL_PARAMS, p["entry"], p["exit"],
-                                init_capital=float(INIT_CAP_PER_TICKER),
-                                pos_frac=float(POS_FRAC),
-                                min_hold_days=int(MIN_HOLD_DAYS),
-                                cooldown_days=int(COOLDOWN_DAYS),
-                                walk_forward=True,
-                                wf_min_train=int(wf_min_train),
-                            )
-                            sharps.append(mets["Sharpe-Ratio"])
-                            trades_total += int(mets["Number of Trades"])
-                        except Exception:
-                            pass
-
-                if feasible == 0:
-                    prog.progress((t+1)/n_trials)
-                    continue
-
-                sharpe_avg = float(np.nanmedian(sharps)) if len(sharps) else float("nan")
-                denom = max(1, feasible * 2)
-                trades_avg = trades_total / denom
-
-                if trades_total < int(min_trades_req) or not np.isfinite(sharpe_avg):
-                    prog.progress((t+1)/n_trials)
-                    continue
-
-                score = sharpe_avg - float(lambda_trades) * float(trades_avg)
-
-                rec = dict(trial=t, score=score, sharpe_avg=sharpe_avg,
-                           trades=trades_total, **p)
-                rows.append(rec)
-                if (best is None) or (score > best["score"]):
-                    best = rec
-
-                prog.progress((t+1)/n_trials)
-
-            if not rows:
-                st.warning("Keine gültigen Kandidaten gefunden.")
-            else:
-                df_res = pd.DataFrame(rows).sort_values("score", ascending=False)
-
-                mask = pd.to_numeric(df_res["trades"], errors="coerce").fillna(0).astype(int) >= int(min_trades_req)
-                df_show = df_res.loc[mask].copy()
-                if df_show.empty:
-                    df_show = df_res.copy()
-
-                st.success(f"Beste Parameter: Score={best['score']:.3f} | Sharpe={best['sharpe_avg']:.2f} | Trades={best['trades']}")
-                c1_, c2_, c3_, c4_, c5_ = st.columns(5)
-                c1_.metric("Lookback", int(best["lookback"]))
-                c2_.metric("Horizon",  int(best["horizon"]))
-                c3_.metric("Target Thresh", f"{best['thresh']:.3f}")
-                c4_.metric("Entry Prob",    f"{best['entry']:.2f}")
-                c5_.metric("Exit Prob",     f"{best['exit']:.2f}")
-
-                st.caption("Top-Ergebnisse (Score = Sharpe − λ·Trades/(Ticker·Hälften))")
-                st.dataframe(df_show.head(25), use_container_width=True)
-                st.download_button("Optimierergebnisse als CSV",
-                                   to_csv_eu(df_res),
-                                   file_name="param_search_results.csv", mime="text/csv")
 
 
 # ─────────────────────────────────────────────────────────────
