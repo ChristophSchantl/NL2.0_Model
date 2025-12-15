@@ -1,6 +1,6 @@
 # streamlit_app.py
 # ─────────────────────────────────────────────────────────────
-# NEW LEVEL 2nd Model – Signal-basierte Strategie (Full Version)
+# NEW LEVEL 2nd Modell – Signal-basierte Strategie (Full Version)
 # pro Ticker separates Konto + robuste Loader + saubere Fixes
 # - Loader: as_completed (korrekte Future→Ticker Zuordnung)
 # - Target: FutureRetExec passend zu "Next Open"
@@ -32,7 +32,7 @@ from sklearn.pipeline import Pipeline
 import plotly.graph_objects as go
 import plotly.express as px
 
-st.set_page_config(page_title="NEW LEVEL 2ND MODEL", layout="wide")
+st.set_page_config(page_title="NEW LEVEL 2ND AI-MODELL", layout="wide")
 LOCAL_TZ = ZoneInfo("Europe/Zurich")
 MAX_WORKERS = 6  # yfinance rate-limit sensibel: ggf. 2-4
 pd.options.display.float_format = "{:,.4f}".format
@@ -939,7 +939,7 @@ with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=Fa
 # ─────────────────────────────────────────────────────────────
 # Haupt – Pipeline
 # ─────────────────────────────────────────────────────────────
-st.markdown("<h1 style='font-size: 36px;'>📈 PROTEUS - AI Modell</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='font-size: 36px;'>📈 NEW LEVEL 2ND AI-MODELL - AI Modell</h1>", unsafe_allow_html=True)
 
 results = []
 all_trades: Dict[str, List[dict]] = {}
