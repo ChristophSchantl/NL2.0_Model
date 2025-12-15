@@ -1320,7 +1320,7 @@ for ticker in TICKERS:
             # ▼ Trades (Next Open) – einklappbar
             # ─────────────────────────────────────────────
             with st.expander(f"Trades (Next Open) für {ticker}", expanded=True):
-            
+
                 trades_df = pd.DataFrame(trades)
             
                 if trades_df.empty:
@@ -1328,19 +1328,32 @@ for ticker in TICKERS:
                 else:
                     td = trades_df.copy()
             
-                    td["Date"] = pd.to_datetime(td["Date"]).dt.strftime("%d.%m.%Y")
+                    # Ticker/Name ergänzen (waren in trades nicht enthalten)
+                    td["Ticker"] = ticker
+                    td["Name"]   = get_ticker_name(ticker)
             
-                    cols = [
-                        "Ticker","Name","Date","Typ","Price","Shares",
-                        "Signal Prob","Hold (days)","PnL","CumPnL","Fees"
-                    ]
-                    td = td[cols]
+                    # Datum formatieren
+                    if "Date" in td.columns:
+                        td["Date"] = pd.to_datetime(td["Date"]).dt.strftime("%d.%m.%Y")
             
-                    st.dataframe(td, use_container_width=True)
+                    # Spalten aus Backtest -> UI-Namen mappen
+                    rename_map = {
+                        "Prob": "Signal Prob",
+                        "HoldDays": "Hold (days)",
+                        "Net P&L": "PnL",
+                        "kum P&L": "CumPnL",
+                    }
+                    td = td.rename(columns={k: v for k, v in rename_map.items() if k in td.columns})
+            
+                    # Wunsch-Spalten (nur die, die wirklich existieren)
+                    desired = ["Ticker","Name","Date","Typ","Price","Shares","Signal Prob","Hold (days)","PnL","CumPnL","Fees"]
+                    show_cols = [c for c in desired if c in td.columns]
+            
+                    st.dataframe(td[show_cols], use_container_width=True)
             
                     st.download_button(
                         "Trades als CSV",
-                        to_csv_eu(td),
+                        to_csv_eu(td[show_cols]),
                         file_name=f"trades_{ticker}.csv",
                         mime="text/csv",
                         key=f"dl_trades_{ticker}",
