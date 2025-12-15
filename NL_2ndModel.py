@@ -1348,6 +1348,94 @@ if results:
         st.dataframe(rt_df.sort_values("Exit Date", ascending=False), use_container_width=True)
         st.download_button("Round-Trips als CSV", to_csv_eu(rt_df), file_name="round_trips.csv", mime="text/csv")
 
+
+
+    # ─────────────────────────────────────────────────────────────
+    # 📊 Verteilung der Round-Trip-Ergebnisse (wie Screenshot)
+    # ─────────────────────────────────────────────────────────────
+    if not rt_df.empty:
+        st.markdown("## 📊 Verteilung der Round-Trip-Ergebnisse")
+    
+        bins = st.slider("Anzahl Bins", 10, 120, 30, step=5, key="rt_bins_slider")
+    
+        # saubere Numerik
+        rt_ret = pd.to_numeric(rt_df.get("Return (%)"), errors="coerce").dropna()
+        rt_pnl = pd.to_numeric(rt_df.get("PnL Net (€)"), errors="coerce").dropna()
+    
+        # KPIs
+        n_trades = int(len(rt_ret)) if len(rt_ret) else int(len(rt_df))
+        winrate = float((rt_ret > 0).mean()) if len(rt_ret) else float("nan")
+        avg_ret = float(rt_ret.mean()) if len(rt_ret) else float("nan")
+        med_ret = float(rt_ret.median()) if len(rt_ret) else float("nan")
+        std_ret = float(rt_ret.std(ddof=0)) if len(rt_ret) else float("nan")
+    
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Anzahl", f"{n_trades}")
+        k2.metric("Winrate", f"{winrate*100:.2f}%" if np.isfinite(winrate) else "–")
+        k3.metric("Ø Return", f"{avg_ret:.2f}%" if np.isfinite(avg_ret) else "–")
+        k4.metric("Median", f"{med_ret:.2f}%" if np.isfinite(med_ret) else "–")
+        k5.metric("Std-Abw.", f"{std_ret:.2f}%" if np.isfinite(std_ret) else "–")
+    
+        colL, colR = st.columns(2)
+    
+        # Histogramm Return (%)
+        with colL:
+            st.markdown("### Histogramm: Return (%)")
+            if rt_ret.empty:
+                st.info("Keine Return-Werte vorhanden.")
+            else:
+                fig_ret = go.Figure()
+                fig_ret.add_trace(go.Histogram(x=rt_ret, nbinsx=int(bins), marker_line_width=0))
+                # Linien: Mean & Median
+                if np.isfinite(avg_ret):
+                    fig_ret.add_vline(x=avg_ret, line_dash="dash", opacity=0.8)
+                if np.isfinite(med_ret):
+                    fig_ret.add_vline(x=med_ret, line_dash="dot", opacity=0.8)
+                fig_ret.update_layout(
+                    height=420,
+                    xaxis_title="Return (%)",
+                    yaxis_title="Häufigkeit",
+                    showlegend=False,
+                    margin=dict(t=40, b=40, l=40, r=20),
+                )
+                st.plotly_chart(fig_ret, use_container_width=True)
+    
+        # Histogramm PnL Net (€)
+        with colR:
+            st.markdown("### Histogramm: PnL Net (€)")
+            if rt_pnl.empty:
+                st.info("Keine PnL-Werte vorhanden.")
+            else:
+                avg_pnl = float(rt_pnl.mean())
+                med_pnl = float(rt_pnl.median())
+    
+                fig_pnl = go.Figure()
+                fig_pnl.add_trace(go.Histogram(x=rt_pnl, nbinsx=int(bins), marker_line_width=0))
+                if np.isfinite(avg_pnl):
+                    fig_pnl.add_vline(x=avg_pnl, line_dash="dash", opacity=0.8)
+                if np.isfinite(med_pnl):
+                    fig_pnl.add_vline(x=med_pnl, line_dash="dot", opacity=0.8)
+                fig_pnl.update_layout(
+                    height=420,
+                    xaxis_title="PnL Net (€)",
+                    yaxis_title="Häufigkeit",
+                    showlegend=False,
+                    margin=dict(t=40, b=40, l=40, r=20),
+                )
+                st.plotly_chart(fig_pnl, use_container_width=True)
+    
+        # Optional: Download der RTs (falls du es hier bündeln willst)
+        st.download_button(
+            "Round-Trips (inkl. Return & PnL) als CSV",
+            to_csv_eu(rt_df),
+            file_name="round_trips_distribution.csv",
+            mime="text/csv",
+            key="dl_rt_distribution",
+        )
+
+
+
+    
     # ─────────────────────────────────────────────────────────────
     # 📈 Portfolio – Equal-Weight Performance (Close-to-Close)
     # ─────────────────────────────────────────────────────────────
