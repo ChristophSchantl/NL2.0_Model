@@ -913,6 +913,25 @@ def estimate_expected_return_from_backtest(feat: pd.DataFrame, forecast_days: in
     return {"mu1": mu1, "mu0": mu0, "p": p, "exp_ret": exp_ret}
 
 
+def classify_signal_state(p: float, entry_thr: float, exit_thr: float) -> str:
+    """
+    Einfache Ampel-Logik:
+    - bullish: p >= entry_thr
+    - bearish: p <= exit_thr
+    - neutral: dazwischen
+    """
+    try:
+        p = float(p)
+    except Exception:
+        return "unknown"
+
+    if p >= float(entry_thr):
+        return "bullish"
+    if p <= float(exit_thr):
+        return "bearish"
+    return "neutral"
+
+
 def _ensure_psd_cov(cov: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     """
     Stabilisiert Cov (numerisch) auf PSD durch Eigenwert-Clipping.
@@ -1352,20 +1371,47 @@ if results:
                         )
                         if not est:
                             continue
+                        p_now = float(est["p"])
+                        p_entry_flag = bool(p_now >= float(ENTRY_PROB))
+                        p_exit_flag  = bool(p_now <= float(EXIT_PROB))
+                        sig_state    = classify_signal_state(p_now, float(ENTRY_PROB), float(EXIT_PROB))
+                        
                         rows_fc.append({
                             "Ticker": tk,
                             "Name": get_ticker_name(tk),
-                            "Weight (open MV)": float(weights_open.get(tk, np.nan)),
-                            "p (SignalProb)": est["p"],
-                            "μ1 (Target=1)": est["mu1"],
-                            "μ0 (Target=0)": est["mu0"],
-                            f"E[r {int(FORECAST_DAYS)}d]": est["exp_ret"],
+                            "Weight (open MV)": float(open_weights.get(tk, np.nan)) if "open_weights" in locals() else np.nan,
+                            "p (SignalProb)": p_now,
+                            "p_entry_flag": p_entry_flag,
+                            "p_exit_flag": p_exit_flag,
+                            "Signal State": sig_state,
+                            "μ1 (Target=1)": float(est["mu1"]),
+                            "μ0 (Target=0)": float(est["mu0"]),
+                            f"E[r {int(FORECAST_DAYS)}d]": float(est["exp_ret"]),
                         })
+
 
                     if not rows_fc:
                         st.info("Forecast: Nicht genug Daten für eine robuste Schätzung der offenen Positionen.")
                     else:
                         fc_df = pd.DataFrame(rows_fc).set_index("Ticker")
+
+                        fc_df = fc_df[[
+                                "Name",
+                                "Weight (open MV)",
+                                "p (SignalProb)",
+                                "Signal State",
+                                "μ1 (Target=1)",
+                                "μ0 (Target=0)",
+                                f"E[r {int(FORECAST_DAYS)}d]"
+                            ]].astype(float, errors="ignore")
+                        
+                            # sortiere nach Expected Return
+                            fc_df = fc_df.sort_values(
+                                by=f"E[r {int(FORECAST_DAYS)}d]",
+                                ascending=False
+                            )
+
+                        
                         st.dataframe(fc_df.sort_values(f"E[r {int(FORECAST_DAYS)}d]", ascending=False), use_container_width=True)
 
                         exp_rets = fc_df[f"E[r {int(FORECAST_DAYS)}d]"].astype(float).dropna()
