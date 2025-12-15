@@ -1316,6 +1316,32 @@ for ticker in TICKERS:
             )
             st.plotly_chart(eq, use_container_width=True)
 
+            # ─────────────────────────────────────────────
+            # 🧾 Trades – DETAILANSICHT (wie im alten Code)
+            # ─────────────────────────────────────────────
+            st.markdown("#### 🧾 Trades (Next Open)")
+            
+            trades_df = pd.DataFrame(trades)
+            
+            if trades_df.empty:
+                st.info("Keine Trades für diesen Zeitraum / diese Parameter.")
+            else:
+                trades_df_disp = trades_df.copy()
+                trades_df_disp["Date"] = pd.to_datetime(trades_df_disp["Date"]).dt.strftime("%Y-%m-%d")
+                trades_df_disp = trades_df_disp.sort_values("Date")
+            
+                st.dataframe(trades_df_disp, use_container_width=True)
+            
+                st.download_button(
+                    "Trades als CSV",
+                    to_csv_eu(trades_df),
+                    file_name=f"trades_{ticker}.csv",
+                    mime="text/csv",
+                    key=f"dl_trades_{ticker}",
+                )
+
+
+        
         except Exception as e:
             st.error(f"Fehler bei {ticker}: {e}")
 
