@@ -1,7 +1,7 @@
 # streamlit_app.py
 # ─────────────────────────────────────────────────────────────
 # PROTEUS – Signal-basierte Strategie (Full Version)
-# (A) pro Ticker separates Konto + Fix: Phase-Style ("Open" blau)
+# (A) pro Ticker separates Konto + robuste Loader + einfache, saubere Fixes
 # ─────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────
@@ -22,17 +22,16 @@ from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor
 
 from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 
 import plotly.graph_objects as go
 import plotly.express as px
 
+
 st.set_page_config(page_title="SHI – STOCK CHECK / PROTEUS", layout="wide")
 LOCAL_TZ = ZoneInfo("Europe/Zurich")
 MAX_WORKERS = 6  # yfinance rate-limit sensibel: ggf. 2-4
-pd.options.display.float_format = "{:,.4f}".format
 
 
 # ─────────────────────────────────────────────────────────────
@@ -289,6 +288,7 @@ def get_price_data_tail_intraday(
         df.dropna(subset=["High", "Low", "Close", "Open"], inplace=True)
         return df, meta
 
+    # intraday tail (nur "heute" aggregieren)
     try:
         intraday = tk.history(period="1d", interval=interval, auto_adjust=True, actions=False, prepost=False)
         if not intraday.empty:
@@ -301,6 +301,7 @@ def get_price_data_tail_intraday(
     except Exception:
         intraday = pd.DataFrame()
 
+    # Market-On-Close live: bis cutoff schneiden (sonst "zu spät" Candle)
     if exec_mode_key.startswith("Market-On-Close") and not intraday.empty:
         now_local = datetime.now(LOCAL_TZ)
         cutoff_time = now_local - timedelta(minutes=int(moc_cutoff_min_val))
@@ -372,15 +373,17 @@ def load_all_prices(tickers: List[str], start: str, end: str,
     st.info(f"Kurse laden für {len(tickers)} Ticker … (parallel)")
     prog = st.progress(0.0)
 
-    futures = []
+    # ✅ Fix: Future -> Ticker Mapping (robust)
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(tickers))) as ex:
-        for tk in tickers:
-            futures.append(ex.submit(
+        future_map = {
+            ex.submit(
                 get_price_data_tail_intraday, tk, 3, use_tail, interval, fallback_last, exec_key, int(moc_cutoff)
-            ))
+            ): tk
+            for tk in tickers
+        }
 
         done = 0
-        for tk, fut in zip(tickers, futures):
+        for fut, tk in list(future_map.items()):
             try:
                 df_full, meta = fut.result()
                 df_use = df_full.loc[str(start):str(end)].copy()
@@ -491,13 +494,19 @@ def get_equity_chain_aggregates_for_today(ticker: str,
 # ─────────────────────────────────────────────────────────────
 def make_features(df: pd.DataFrame, lookback: int, horizon: int, exog: Optional[pd.DataFrame]=None) -> pd.DataFrame:
     feat = df.copy()
+
     feat["Range"]     = feat["High"].rolling(lookback).max() - feat["Low"].rolling(lookback).min()
     feat["SlopeHigh"] = feat["High"].rolling(lookback).apply(slope, raw=True)
     feat["SlopeLow"]  = feat["Low"].rolling(lookback).apply(slope, raw=True)
+
     feat = feat.iloc[lookback-1:].copy()
+
     if exog is not None and not exog.empty:
         feat = feat.join(exog, how="left").ffill()
-    feat["FutureRet"] = feat["Close"].shift(-horizon) / feat["Close"] - 1
+
+    # ✅ Fix: Target konsistent zum "Next Open"-Execution
+    # FutureRetExec(t) = Open(t+horizon) / Open(t+1) - 1
+    feat["FutureRetExec"] = feat["Open"].shift(-horizon) / feat["Open"].shift(-1) - 1
     return feat
 
 
@@ -522,7 +531,9 @@ def make_features_and_train(
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[dict], dict]:
 
     feat = make_features(df, lookback, horizon, exog=exog_df)
-    hist = feat.iloc[:-1].dropna(subset=["FutureRet"]).copy()
+
+    # Traininghistorie ohne letzte Zeile (weil Zukunftsreturn fehlt)
+    hist = feat.iloc[:-1].dropna(subset=["FutureRetExec"]).copy()
     if len(hist) < 30:
         raise ValueError("Zu wenige Datenpunkte nach Preprocessing für das Modell.")
 
@@ -531,12 +542,12 @@ def make_features_and_train(
                 "IV_skew_p_minus_c", "VOL_tot", "OI_tot"]
     X_cols += [c for c in opt_cols if c in feat.columns]
 
-    hist["Target"] = (hist["FutureRet"] > threshold).astype(int)
+    hist["Target"] = (hist["FutureRetExec"] > threshold).astype(int)
 
     def make_pipe():
+        # ✅ Fix: kein StandardScaler (GBDT braucht den nicht, spart CPU & Komplexität)
         return Pipeline(steps=[
             ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
             ("model", GradientBoostingClassifier(**model_params)),
         ])
 
@@ -552,10 +563,10 @@ def make_features_and_train(
             min_train = max(int(wf_min_train), lookback + horizon + 10)
 
             for t in range(min_train, len(feat)):
-                train = feat.iloc[:t].dropna(subset=["FutureRet"]).copy()
+                train = feat.iloc[:t].dropna(subset=["FutureRetExec"]).copy()
                 if len(train) < min_train:
                     continue
-                train["Target"] = (train["FutureRet"] > threshold).astype(int)
+                train["Target"] = (train["FutureRetExec"] > threshold).astype(int)
                 if train["Target"].nunique() < 2:
                     continue
 
@@ -565,7 +576,9 @@ def make_features_and_train(
 
             feat["SignalProb"] = pd.Series(probs, index=feat.index).ffill().fillna(0.5)
 
+    # Backtest arbeitet bewusst ohne "heute"-Zeile (feat.iloc[:-1])
     feat_bt = feat.iloc[:-1].copy()
+
     df_bt, trades = backtest_next_open(
         feat_bt,
         entry_prob, exit_prob,
@@ -630,7 +643,7 @@ def backtest_next_open(
                 fee_entry    = invest_net * float(commission)
                 target_shares = max((invest_net - fee_entry) / slip_buy, 0.0)
 
-                if target_shares > 0 and (target_shares * slip_buy + fee_entry) <= cash_net + 1e-9:
+                if target_shares > 0 and (target_shares * slip_buy + fee_entry) <= cash_net + 1e-6:
                     shares = target_shares
                     cost_basis_gross = shares * slip_buy
                     cost_basis_net   = shares * slip_buy + fee_entry
@@ -691,8 +704,11 @@ def backtest_next_open(
 def _cagr_from_path(values: pd.Series) -> float:
     if len(values) < 2:
         return np.nan
-    years = len(values) / 252.0
-    return (values.iloc[-1] / values.iloc[0]) ** (1/years) - 1 if years > 0 else np.nan
+    dt0 = values.index[0]
+    dt1 = values.index[-1]
+    # ✅ Fix: echte Zeit (Tage) statt len/252
+    years = max((dt1 - dt0).days / 365.25, 1e-9)
+    return (values.iloc[-1] / values.iloc[0]) ** (1/years) - 1
 
 
 def _sortino(rets: pd.Series) -> float:
@@ -1025,7 +1041,7 @@ for ticker in TICKERS:
 
             st.caption(
                 f"Entry/Exit: {'Walk-Forward' if use_walk_forward else 'In-Sample'} "
-                f"| Target: FutureRet > {THRESH:.3f} (in {HORIZON}d)"
+                f"| Target: FutureRetExec(Open→Open) > {THRESH:.3f} (in {HORIZON}d)"
             )
 
             chart_cols = st.columns(2)
@@ -1183,7 +1199,7 @@ if live_forecasts_run:
 if results:
     summary_df = pd.DataFrame(results).set_index("Ticker")
 
-    # ✅ FIX 1: Phase normalisieren (damit Styling sicher trifft)
+    # Phase normalisieren (Styling stabil)
     if "Phase" in summary_df.columns:
         summary_df["Phase"] = (
             summary_df["Phase"]
@@ -1219,7 +1235,6 @@ if results:
     cols_pct[2].metric("Buy & Hold Net (%) – total", f"{bh_total_pct:.2f}")
     cols_pct[3].metric("Durchschn. CAGR (%)", f"{summary_df['CAGR (%)'].dropna().mean():.2f}" if "CAGR (%)" in summary_df else "–")
 
-    # ✅ FIX 2: Phase Styling (Open blau)
     def phase_style(val):
         v = str(val).strip().lower()
         if v == "open":
@@ -1245,7 +1260,6 @@ if results:
     if "Phase" in summary_df.columns:
         styled_sum = styled_sum.applymap(phase_style, subset=["Phase"])
 
-    # ✅ FIX 3: immer HTML rendern (kein st.dataframe-Fallback → Farben bleiben)
     show_styled_or_plain(summary_df, styled_sum)
 
     st.download_button(
@@ -1311,7 +1325,9 @@ if results:
                 fig_pnl.update_layout(title="Histogramm: PnL Net (€)", height=360, showlegend=False)
                 st.plotly_chart(fig_pnl, use_container_width=True)
 
-        # Korrelation
+        # ─────────────────────────────────────────────────────────────
+        # Korrelation (Close-Returns) – ohne künstliches ffill
+        # ─────────────────────────────────────────────────────────────
         st.markdown("### 🔗 Portfolio-Korrelation (Close-Returns)")
         price_series = []
         for tk, dfbt in all_dfs.items():
@@ -1319,14 +1335,15 @@ if results:
                 s = dfbt["Close"].copy()
                 s.name = tk
                 price_series.append(s)
-        
+
         if len(price_series) < 2:
             st.info("Mindestens zwei Ticker mit Daten nötig.")
         else:
-            prices = pd.concat(price_series, axis=1, join="outer").sort_index().ffill()
-            rets = prices.pct_change().dropna(how="all")
-            corr = rets.corr(method="pearson")
-        
+            prices = pd.concat(price_series, axis=1, join="outer").sort_index()
+            rets = prices.pct_change()
+            # ✅ Fix: min overlap, kein ffill → weniger künstliche 0%-Returns
+            corr = rets.corr(method="pearson", min_periods=60)
+
             fig_corr = px.imshow(
                 corr,
                 text_auto=".2f",
@@ -1334,85 +1351,72 @@ if results:
                 color_continuous_scale="RdBu",
                 zmin=-1, zmax=1
             )
-        
-            # ✅ Labels NICHT automatisch ausdünnen
-            fig_corr.update_xaxes(
-                tickmode="array",
-                tickvals=list(range(len(corr.columns))),
-                ticktext=list(corr.columns),
-                tickangle=45,
-                automargin=True
-            )
-            fig_corr.update_yaxes(
-                tickmode="array",
-                tickvals=list(range(len(corr.index))),
-                ticktext=list(corr.index),
-                automargin=True
-            )
-        
+
+            fig_corr.update_xaxes(tickangle=45, automargin=True)
+            fig_corr.update_yaxes(automargin=True)
+
             fig_corr.update_layout(
                 height=650,
                 margin=dict(t=40, l=80, r=30, b=120),
                 coloraxis_colorbar=dict(title="ρ")
             )
-        
+
             st.plotly_chart(fig_corr, use_container_width=True)
 
+        # ─────────────────────────────────────────────────────────────
+        # Portfolio (Equal-Weight) – Close-to-Close Performance
+        # ─────────────────────────────────────────────────────────────
+        st.markdown("### 📈 Portfolio – Equal-Weight Performance (Close-to-Close)")
 
-            # ─────────────────────────────────────────────────────────────
-            # 📈 Portfolio (Equal-Weight) – Avg Return / Vol / Sharpe / DD
-            # ─────────────────────────────────────────────────────────────
-            st.markdown("### 📈 Portfolio – Equal-Weight Performance (Close-to-Close)")
-            
-            # Preise aus all_dfs sammeln
-            price_series = []
-            for tk, dfbt in all_dfs.items():
-                if isinstance(dfbt, pd.DataFrame) and "Close" in dfbt.columns and len(dfbt) >= 2:
-                    s = dfbt["Close"].copy()
-                    s.name = tk
-                    price_series.append(s)
-            
-            if len(price_series) < 2:
-                st.info("Portfolio-Analytics: Mindestens zwei Ticker mit Close-Daten nötig.")
-            else:
-                prices = pd.concat(price_series, axis=1, join="outer").sort_index().ffill()
-                rets = prices.pct_change()
-            
-                # Equal-Weight Portfolio Return (tägliches Rebalancing)
-                w = np.ones(rets.shape[1], dtype=float) / rets.shape[1]
-                port_ret = rets.mul(w, axis=1).sum(axis=1).dropna()
-            
-                # Kennzahlen
-                ann_return = (1.0 + port_ret.mean()) ** 252 - 1.0
-                ann_vol = port_ret.std(ddof=0) * np.sqrt(252)
-                sharpe = (port_ret.mean() / (port_ret.std(ddof=0) + 1e-12)) * np.sqrt(252)
-            
-                nav0 = float(INIT_CAP_PER_TICKER) * len(summary_df)
-                nav = nav0 * (1.0 + port_ret).cumprod()
-                dd = (nav / nav.cummax()) - 1.0
-                max_dd = float(dd.min())
-            
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Ø Return p.a.", f"{ann_return*100:.2f}%")
-                c2.metric("Vol p.a.", f"{ann_vol*100:.2f}%")
-                c3.metric("Sharpe", f"{sharpe:.2f}")
-                c4.metric("Max Drawdown", f"{max_dd*100:.2f}%")
-            
-                fig_nav = go.Figure()
-                fig_nav.add_trace(go.Scatter(x=nav.index, y=nav.values, mode="lines", name="Portfolio NAV"))
-                fig_nav.update_layout(height=380, title="Portfolio NAV (Equal-Weight, Close-to-Close)",
-                                      xaxis_title="Datum", yaxis_title="NAV (€)",
-                                      margin=dict(t=45, b=30, l=40, r=20))
-                st.plotly_chart(fig_nav, use_container_width=True)
-            
-                st.download_button(
-                    "Portfolio-Returns (daily) als CSV",
-                    to_csv_eu(pd.DataFrame({"Date": port_ret.index, "PortfolioRet": port_ret.values})),
-                    file_name="portfolio_returns_daily.csv",
-                    mime="text/csv",
-                )
+        price_series = []
+        for tk, dfbt in all_dfs.items():
+            if isinstance(dfbt, pd.DataFrame) and "Close" in dfbt.columns and len(dfbt) >= 2:
+                s = dfbt["Close"].copy()
+                s.name = tk
+                price_series.append(s)
 
+        if len(price_series) < 2:
+            st.info("Portfolio-Analytics: Mindestens zwei Ticker mit Close-Daten nötig.")
+        else:
+            prices = pd.concat(price_series, axis=1, join="outer").sort_index()
+            rets = prices.pct_change()
 
+            # Equal-Weight (tägliches Rebalancing) – nur Tage nutzen, wo mind. 2 Assets Returns haben
+            valid = rets.notna().sum(axis=1) >= 2
+            rets2 = rets.loc[valid].copy()
+
+            w = np.ones(rets2.shape[1], dtype=float) / rets2.shape[1]
+            port_ret = rets2.mul(w, axis=1).sum(axis=1).dropna()
+
+            # Kennzahlen (einfach & stabil)
+            ann_return = (1.0 + port_ret).prod() ** (252 / max(len(port_ret), 1)) - 1.0
+            ann_vol = port_ret.std(ddof=0) * np.sqrt(252)
+            sharpe = (port_ret.mean() / (port_ret.std(ddof=0) + 1e-12)) * np.sqrt(252)
+
+            nav0 = float(INIT_CAP_PER_TICKER) * len(summary_df)
+            nav = nav0 * (1.0 + port_ret).cumprod()
+            dd = (nav / nav.cummax()) - 1.0
+            max_dd = float(dd.min())
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Ø Return p.a.", f"{ann_return*100:.2f}%")
+            c2.metric("Vol p.a.", f"{ann_vol*100:.2f}%")
+            c3.metric("Sharpe", f"{sharpe:.2f}")
+            c4.metric("Max Drawdown", f"{max_dd*100:.2f}%")
+
+            fig_nav = go.Figure()
+            fig_nav.add_trace(go.Scatter(x=nav.index, y=nav.values, mode="lines", name="Portfolio NAV"))
+            fig_nav.update_layout(height=380, title="Portfolio NAV (Equal-Weight, Close-to-Close)",
+                                  xaxis_title="Datum", yaxis_title="NAV (€)",
+                                  margin=dict(t=45, b=30, l=40, r=20))
+            st.plotly_chart(fig_nav, use_container_width=True)
+
+            st.download_button(
+                "Portfolio-Returns (daily) als CSV",
+                to_csv_eu(pd.DataFrame({"Date": port_ret.index, "PortfolioRet": port_ret.values})),
+                file_name="portfolio_returns_daily.csv",
+                mime="text/csv",
+            )
 
 else:
     st.warning("Noch keine Ergebnisse verfügbar. Prüfe Ticker-Eingaben und Datenabdeckung.")
