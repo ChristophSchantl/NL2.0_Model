@@ -1311,28 +1311,97 @@ if results:
         st.download_button("Round-Trips als CSV", to_csv_eu(rt_df), file_name="round_trips.csv", mime="text/csv")
 
         st.markdown("### 📊 Verteilung der Round-Trip-Ergebnisse")
-        bins = st.slider("Anzahl Bins", 10, 100, 30, step=5, key="rt_bins")
 
+        # Slider
+        bins = st.slider("Anzahl Bins", 10, 100, 30, step=5, key="rt_bins")
+        
+        # Daten robust casten
         ret = pd.to_numeric(rt_df.get("Return (%)"), errors="coerce").dropna()
         pnl = pd.to_numeric(rt_df.get("PnL Net (€)"), errors="coerce").dropna()
-
+        
+        n_trades = int(len(ret))
+        winrate = float((ret > 0).mean() * 100) if n_trades else np.nan
+        mean_ret = float(ret.mean()) if n_trades else np.nan
+        median_ret = float(ret.median()) if n_trades else np.nan
+        std_ret = float(ret.std(ddof=0)) if n_trades else np.nan
+        
+        # KPIs oben (wie in deinem Screenshot)
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Anzahl", f"{n_trades}")
+        k2.metric("Winrate", "–" if not np.isfinite(winrate) else f"{winrate:.2f}%")
+        k3.metric("Ø Return", "–" if not np.isfinite(mean_ret) else f"{mean_ret:.2f}%")
+        k4.metric("Median", "–" if not np.isfinite(median_ret) else f"{median_ret:.2f}%")
+        k5.metric("Std-Abw.", "–" if not np.isfinite(std_ret) else f"{std_ret:.2f}%")
+        
         col_h1, col_h2 = st.columns(2)
+        
+        # Histogramm Return (%)
         with col_h1:
             if ret.empty:
                 st.info("Keine Return-Werte vorhanden.")
             else:
-                fig_ret = go.Figure(go.Histogram(x=ret, nbinsx=bins, marker_line_width=0))
-                fig_ret.add_vline(x=0, line_dash="dash", opacity=0.5)
-                fig_ret.update_layout(title="Histogramm: Return (%)", height=360, showlegend=False)
+                fig_ret = go.Figure()
+                fig_ret.add_trace(go.Histogram(x=ret, nbinsx=bins, name="Return (%)", marker_line_width=0))
+        
+                # Linien: Mean & Median (wie Screenshot)
+                if np.isfinite(mean_ret):
+                    fig_ret.add_vline(
+                        x=mean_ret, line_dash="dot", line_width=2,
+                        annotation_text="Ø", annotation_position="top"
+                    )
+                if np.isfinite(median_ret):
+                    fig_ret.add_vline(
+                        x=median_ret, line_dash="dash", line_width=2,
+                        annotation_text="Median", annotation_position="top"
+                    )
+        
+                # Optional: 0-Linie
+                fig_ret.add_vline(x=0, line_dash="dash", opacity=0.4)
+        
+                fig_ret.update_layout(
+                    title="Histogramm: Return (%)",
+                    xaxis_title="Return (%)",
+                    yaxis_title="Häufigkeit",
+                    height=380,
+                    showlegend=False,
+                    margin=dict(t=50, b=40, l=40, r=20),
+                )
                 st.plotly_chart(fig_ret, use_container_width=True)
+        
+        # Histogramm PnL Net (€)
         with col_h2:
             if pnl.empty:
                 st.info("Keine PnL-Werte vorhanden.")
             else:
-                fig_pnl = go.Figure(go.Histogram(x=pnl, nbinsx=bins, marker_line_width=0))
-                fig_pnl.add_vline(x=0, line_dash="dash", opacity=0.5)
-                fig_pnl.update_layout(title="Histogramm: PnL Net (€)", height=360, showlegend=False)
+                mean_pnl = float(pnl.mean()) if len(pnl) else np.nan
+                median_pnl = float(pnl.median()) if len(pnl) else np.nan
+        
+                fig_pnl = go.Figure()
+                fig_pnl.add_trace(go.Histogram(x=pnl, nbinsx=bins, name="PnL Net (€)", marker_line_width=0))
+        
+                if np.isfinite(mean_pnl):
+                    fig_pnl.add_vline(
+                        x=mean_pnl, line_dash="dot", line_width=2,
+                        annotation_text="Ø", annotation_position="top"
+                    )
+                if np.isfinite(median_pnl):
+                    fig_pnl.add_vline(
+                        x=median_pnl, line_dash="dash", line_width=2,
+                        annotation_text="Median", annotation_position="top"
+                    )
+        
+                fig_pnl.add_vline(x=0, line_dash="dash", opacity=0.4)
+        
+                fig_pnl.update_layout(
+                    title="Histogramm: PnL Net (€)",
+                    xaxis_title="PnL Net (€)",
+                    yaxis_title="Häufigkeit",
+                    height=380,
+                    showlegend=False,
+                    margin=dict(t=50, b=40, l=40, r=20),
+                )
                 st.plotly_chart(fig_pnl, use_container_width=True)
+
 
     # ─────────────────────────────────────────────────────────────
     # 🔗 Portfolio-Korrelation (Close-Returns)
