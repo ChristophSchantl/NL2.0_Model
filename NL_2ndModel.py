@@ -1,7 +1,11 @@
 # streamlit_app.py
 # ─────────────────────────────────────────────────────────────
 # PROTEUS – Signal-basierte Strategie (Full Version)
-# (A) pro Ticker separates Konto + robuste Loader + einfache, saubere Fixes
+# pro Ticker separates Konto + robuste Loader + saubere Fixes
+# - Loader: as_completed (korrekte Future→Ticker Zuordnung)
+# - Target: FutureRetExec passend zu "Next Open"
+# - Portfolio: Equal-Weight täglich renormalisiert (kein Cash-Drag durch NaNs)
+# - Korrelation: tz/remove + normalize + realistische Overlap-Basis
 # ─────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────
@@ -19,7 +23,7 @@ from math import sqrt
 from datetime import datetime, timedelta
 from typing import Tuple, List, Dict, Optional
 from zoneinfo import ZoneInfo
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.impute import SimpleImputer
@@ -28,11 +32,10 @@ from sklearn.pipeline import Pipeline
 import plotly.graph_objects as go
 import plotly.express as px
 
-
 st.set_page_config(page_title="SHI – STOCK CHECK / PROTEUS", layout="wide")
 LOCAL_TZ = ZoneInfo("Europe/Zurich")
 MAX_WORKERS = 6  # yfinance rate-limit sensibel: ggf. 2-4
-
+pd.options.display.float_format = "{:,.4f}".format
 
 # ─────────────────────────────────────────────────────────────
 # Helpers (CSV zuerst wegen früher Nutzung)
@@ -145,7 +148,7 @@ COMMISSION   = st.sidebar.number_input("Commission (ad valorem, z.B. 0.001=10bp)
 SLIPPAGE_BPS = st.sidebar.number_input("Slippage (bp je Ausführung)", 0, 50, 5, step=1)
 POS_FRAC     = st.sidebar.slider("Positionsgröße (% des Kapitals)", 0.1, 1.0, 1.0, step=0.1)
 
-# (A) Pro Ticker separates Konto:
+# Pro Ticker separates Konto:
 INIT_CAP_PER_TICKER = st.sidebar.number_input("Initial Capital pro Ticker (€)", min_value=1000.0, value=10_000.0, step=1000.0, format="%.2f")
 
 # Intraday
@@ -193,11 +196,6 @@ if c2.button("↻ Rerun"):
 # Misc Helpers
 # ─────────────────────────────────────────────────────────────
 def show_styled_or_plain(df: pd.DataFrame, styler):
-    """
-    Robustes Rendering:
-    - bevorzugt HTML-Styler (damit Farben zuverlässig sind)
-    - Fallback nur wenn Styler wirklich scheitert
-    """
     try:
         st.markdown(styler.to_html(), unsafe_allow_html=True)
     except Exception as e:
@@ -301,12 +299,13 @@ def get_price_data_tail_intraday(
     except Exception:
         intraday = pd.DataFrame()
 
-    # Market-On-Close live: bis cutoff schneiden (sonst "zu spät" Candle)
+    # Market-On-Close live: bis cutoff schneiden
     if exec_mode_key.startswith("Market-On-Close") and not intraday.empty:
         now_local = datetime.now(LOCAL_TZ)
         cutoff_time = now_local - timedelta(minutes=int(moc_cutoff_min_val))
         intraday = intraday.loc[:cutoff_time]
 
+    # fallback auf letzte Session
     if intraday.empty and fallback_last_session:
         try:
             intraday5 = tk.history(period="5d", interval=interval, auto_adjust=True, actions=False, prepost=False)
@@ -362,9 +361,11 @@ def get_intraday_last_n_sessions(ticker: str, sessions: int = 5, days_buffer: in
     return intr.loc[mask].copy()
 
 
-def load_all_prices(tickers: List[str], start: str, end: str,
-                    use_tail: bool, interval: str, fallback_last: bool,
-                    exec_key: str, moc_cutoff: int) -> Tuple[Dict[str, pd.DataFrame], Dict[str, dict]]:
+def load_all_prices(
+    tickers: List[str], start: str, end: str,
+    use_tail: bool, interval: str, fallback_last: bool,
+    exec_key: str, moc_cutoff: int
+) -> Tuple[Dict[str, pd.DataFrame], Dict[str, dict]]:
     price_map: Dict[str, pd.DataFrame] = {}
     meta_map: Dict[str, dict] = {}
     if not tickers:
@@ -373,7 +374,6 @@ def load_all_prices(tickers: List[str], start: str, end: str,
     st.info(f"Kurse laden für {len(tickers)} Ticker … (parallel)")
     prog = st.progress(0.0)
 
-    # ✅ Fix: Future -> Ticker Mapping (robust)
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(tickers))) as ex:
         future_map = {
             ex.submit(
@@ -383,7 +383,8 @@ def load_all_prices(tickers: List[str], start: str, end: str,
         }
 
         done = 0
-        for fut, tk in list(future_map.items()):
+        for fut in as_completed(future_map):
+            tk = future_map[fut]
             try:
                 df_full, meta = fut.result()
                 df_use = df_full.loc[str(start):str(end)].copy()
@@ -416,11 +417,13 @@ def _band_mask(strikes: pd.Series, atm: float, band: float) -> pd.Series:
 
 
 @st.cache_data(show_spinner=False, ttl=180)
-def get_equity_chain_aggregates_for_today(ticker: str,
-                                          ref_price: float,
-                                          atm_band: float,
-                                          n_exps: int,
-                                          max_days: int) -> pd.DataFrame:
+def get_equity_chain_aggregates_for_today(
+    ticker: str,
+    ref_price: float,
+    atm_band: float,
+    n_exps: int,
+    max_days: int
+) -> pd.DataFrame:
     tk = yf.Ticker(ticker)
     try:
         exps = tk.options or []
@@ -493,6 +496,9 @@ def get_equity_chain_aggregates_for_today(ticker: str,
 # Features
 # ─────────────────────────────────────────────────────────────
 def make_features(df: pd.DataFrame, lookback: int, horizon: int, exog: Optional[pd.DataFrame]=None) -> pd.DataFrame:
+    if len(df) < (lookback + horizon + 5):
+        raise ValueError("Zu wenige Bars für Lookback/Horizon (bitte Zeitraum erweitern oder Parameter senken).")
+
     feat = df.copy()
 
     feat["Range"]     = feat["High"].rolling(lookback).max() - feat["Low"].rolling(lookback).min()
@@ -504,14 +510,14 @@ def make_features(df: pd.DataFrame, lookback: int, horizon: int, exog: Optional[
     if exog is not None and not exog.empty:
         feat = feat.join(exog, how="left").ffill()
 
-    # ✅ Fix: Target konsistent zum "Next Open"-Execution
+    # Target konsistent zu "Next Open"
     # FutureRetExec(t) = Open(t+horizon) / Open(t+1) - 1
     feat["FutureRetExec"] = feat["Open"].shift(-horizon) / feat["Open"].shift(-1) - 1
     return feat
 
 
 # ─────────────────────────────────────────────────────────────
-# Model Training + Backtest (A: pro Ticker separates Konto)
+# Model Training + Backtest (pro Ticker separates Konto)
 # ─────────────────────────────────────────────────────────────
 def make_features_and_train(
     df: pd.DataFrame,
@@ -532,7 +538,6 @@ def make_features_and_train(
 
     feat = make_features(df, lookback, horizon, exog=exog_df)
 
-    # Traininghistorie ohne letzte Zeile (weil Zukunftsreturn fehlt)
     hist = feat.iloc[:-1].dropna(subset=["FutureRetExec"]).copy()
     if len(hist) < 30:
         raise ValueError("Zu wenige Datenpunkte nach Preprocessing für das Modell.")
@@ -545,7 +550,6 @@ def make_features_and_train(
     hist["Target"] = (hist["FutureRetExec"] > threshold).astype(int)
 
     def make_pipe():
-        # ✅ Fix: kein StandardScaler (GBDT braucht den nicht, spart CPU & Komplexität)
         return Pipeline(steps=[
             ("imputer", SimpleImputer(strategy="median")),
             ("model", GradientBoostingClassifier(**model_params)),
@@ -576,7 +580,6 @@ def make_features_and_train(
 
             feat["SignalProb"] = pd.Series(probs, index=feat.index).ffill().fillna(0.5)
 
-    # Backtest arbeitet bewusst ohne "heute"-Zeile (feat.iloc[:-1])
     feat_bt = feat.iloc[:-1].copy()
 
     df_bt, trades = backtest_next_open(
@@ -639,8 +642,8 @@ def backtest_next_open(
 
             can_enter = (not in_pos) and (prob_prev > entry_thr) and cool_ok
             if can_enter:
-                invest_net   = cash_net * float(pos_frac)
-                fee_entry    = invest_net * float(commission)
+                invest_net    = cash_net * float(pos_frac)
+                fee_entry     = invest_net * float(commission)
                 target_shares = max((invest_net - fee_entry) / slip_buy, 0.0)
 
                 if target_shares > 0 and (target_shares * slip_buy + fee_entry) <= cash_net + 1e-6:
@@ -704,9 +707,8 @@ def backtest_next_open(
 def _cagr_from_path(values: pd.Series) -> float:
     if len(values) < 2:
         return np.nan
-    dt0 = values.index[0]
-    dt1 = values.index[-1]
-    # ✅ Fix: echte Zeit (Tage) statt len/252
+    dt0 = pd.to_datetime(values.index[0])
+    dt1 = pd.to_datetime(values.index[-1])
     years = max((dt1 - dt0).days / 365.25, 1e-9)
     return (values.iloc[-1] / values.iloc[0]) ** (1/years) - 1
 
@@ -809,7 +811,7 @@ def compute_round_trips(all_trades: Dict[str, List[dict]]) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────
-# 🧭 Parameter-Optimierung (wie im Original)
+# 🧭 Parameter-Optimierung (Random Search mit Walk-Forward-Light)
 # ─────────────────────────────────────────────────────────────
 st.subheader("🧭 Parameter-Optimierung")
 with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=False):
@@ -920,12 +922,12 @@ with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=Fa
                     df_show = df_res.copy()
 
                 st.success(f"Beste Parameter: Score={best['score']:.3f} | Sharpe={best['sharpe_avg']:.2f} | Trades={best['trades']}")
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Lookback", int(best["lookback"]))
-                c2.metric("Horizon",  int(best["horizon"]))
-                c3.metric("Target Thresh", f"{best['thresh']:.3f}")
-                c4.metric("Entry Prob",    f"{best['entry']:.2f}")
-                c5.metric("Exit Prob",     f"{best['exit']:.2f}")
+                c1_, c2_, c3_, c4_, c5_ = st.columns(5)
+                c1_.metric("Lookback", int(best["lookback"]))
+                c2_.metric("Horizon",  int(best["horizon"]))
+                c3_.metric("Target Thresh", f"{best['thresh']:.3f}")
+                c4_.metric("Entry Prob",    f"{best['entry']:.2f}")
+                c5_.metric("Exit Prob",     f"{best['exit']:.2f}")
 
                 st.caption("Top-Ergebnisse (Score = Sharpe − λ·Trades/(Ticker·Hälften))")
                 st.dataframe(df_show.head(25), use_container_width=True)
@@ -1031,13 +1033,13 @@ for ticker in TICKERS:
 
             live_forecasts_run.append(row)
 
-            c1, c2, c3, c4, c5, c6 = st.columns(6)
-            c1.metric("Strategie Netto (%)", f"{metrics['Strategy Net (%)']:.2f}")
-            c2.metric("Buy & Hold (%)",      f"{metrics['Buy & Hold Net (%)']:.2f}")
-            c3.metric("Sharpe",               f"{metrics['Sharpe-Ratio']:.2f}")
-            c4.metric("Sortino",              f"{metrics['Sortino-Ratio']:.2f}" if np.isfinite(metrics["Sortino-Ratio"]) else "–")
-            c5.metric("Max DD (%)",           f"{metrics['Max Drawdown (%)']:.2f}")
-            c6.metric("Trades (Round-Trips)", f"{int(metrics['Number of Trades'])}")
+            c1m, c2m, c3m, c4m, c5m, c6m = st.columns(6)
+            c1m.metric("Strategie Netto (%)", f"{metrics['Strategy Net (%)']:.2f}")
+            c2m.metric("Buy & Hold (%)",      f"{metrics['Buy & Hold Net (%)']:.2f}")
+            c3m.metric("Sharpe",               f"{metrics['Sharpe-Ratio']:.2f}")
+            c4m.metric("Sortino",              f"{metrics['Sortino-Ratio']:.2f}" if np.isfinite(metrics["Sortino-Ratio"]) else "–")
+            c5m.metric("Max DD (%)",           f"{metrics['Max Drawdown (%)']:.2f}")
+            c6m.metric("Trades (Round-Trips)", f"{int(metrics['Number of Trades'])}")
 
             st.caption(
                 f"Entry/Exit: {'Walk-Forward' if use_walk_forward else 'In-Sample'} "
@@ -1059,8 +1061,11 @@ for ticker in TICKERS:
                 seg_x = df_plot.index[i:i+2]
                 seg_y = df_plot["Close"].iloc[i:i+2]
                 color_seg = px.colors.sample_colorscale(px.colors.diverging.RdYlGn, float(norm.iloc[i]))[0]
-                price_fig.add_trace(go.Scatter(x=seg_x, y=seg_y, mode="lines", showlegend=False,
-                                               line=dict(color=color_seg, width=2), hoverinfo="skip"))
+                price_fig.add_trace(go.Scatter(
+                    x=seg_x, y=seg_y, mode="lines", showlegend=False,
+                    line=dict(color=color_seg, width=2), hoverinfo="skip"
+                ))
+
             trades_df = pd.DataFrame(trades)
             if not trades_df.empty:
                 trades_df["Date"] = pd.to_datetime(trades_df["Date"])
@@ -1075,6 +1080,7 @@ for ticker in TICKERS:
                     marker_symbol="triangle-down", marker=dict(size=12, color="red"),
                     hovertemplate="Exit<br>Datum:%{x|%Y-%m-%d}<br>Preis:%{y:.2f}<extra></extra>"
                 ))
+
             price_fig.update_layout(
                 title=f"{ticker}: Preis mit Signal-Wahrscheinlichkeit (Daily)",
                 xaxis_title="Datum", yaxis_title="Preis",
@@ -1111,14 +1117,21 @@ for ticker in TICKERS:
                     st.plotly_chart(intr_fig, use_container_width=True)
 
             eq = go.Figure()
-            eq.add_trace(go.Scatter(x=df_bt.index, y=df_bt["Equity_Net"], name="Strategy Net Equity (Next Open)",
-                        mode="lines", hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}€<extra></extra>"))
+            eq.add_trace(go.Scatter(
+                x=df_bt.index, y=df_bt["Equity_Net"], name="Strategy Net Equity (Next Open)",
+                mode="lines", hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}€<extra></extra>"
+            ))
             bh_curve = INIT_CAP_PER_TICKER * df_bt["Close"] / df_bt["Close"].iloc[0]
-            eq.add_trace(go.Scatter(x=df_bt.index, y=bh_curve, name="Buy & Hold", mode="lines",
-                                    line=dict(dash="dash", color="black")))
-            eq.update_layout(title=f"{ticker}: Net Equity-Kurve vs. Buy & Hold", xaxis_title="Datum", yaxis_title="Equity (€)",
-                             height=400, margin=dict(t=50, b=30, l=40, r=20),
-                             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+            eq.add_trace(go.Scatter(
+                x=df_bt.index, y=bh_curve, name="Buy & Hold", mode="lines",
+                line=dict(dash="dash", color="black")
+            ))
+            eq.update_layout(
+                title=f"{ticker}: Net Equity-Kurve vs. Buy & Hold",
+                xaxis_title="Datum", yaxis_title="Equity (€)",
+                height=400, margin=dict(t=50, b=30, l=40, r=20),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
             st.plotly_chart(eq, use_container_width=True)
 
             with st.expander(f"Trades (Next Open) für {ticker}", expanded=False):
@@ -1194,18 +1207,15 @@ if live_forecasts_run:
 
 
 # ─────────────────────────────────────────────────────────────
-# Summary / Open Positions / Round-Trips / Histogramme / Korrelation
+# Summary / Open Positions / Round-Trips / Histogramme / Korrelation / Portfolio
 # ─────────────────────────────────────────────────────────────
 if results:
     summary_df = pd.DataFrame(results).set_index("Ticker")
 
-    # Phase normalisieren (Styling stabil)
     if "Phase" in summary_df.columns:
         summary_df["Phase"] = (
             summary_df["Phase"]
-            .astype(str)
-            .str.strip()
-            .str.lower()
+            .astype(str).str.strip().str.lower()
             .replace({"nan": ""})
             .map(lambda x: "Open" if x == "open" else ("Flat" if x == "flat" else x.capitalize()))
         )
@@ -1256,7 +1266,6 @@ if results:
         })
         .set_caption("Strategy-Performance per Ticker (Next Open Execution)")
     )
-
     if "Phase" in summary_df.columns:
         styled_sum = styled_sum.applymap(phase_style, subset=["Phase"])
 
@@ -1325,143 +1334,148 @@ if results:
                 fig_pnl.update_layout(title="Histogramm: PnL Net (€)", height=360, showlegend=False)
                 st.plotly_chart(fig_pnl, use_container_width=True)
 
-        st.markdown("### 🔗 Portfolio-Korrelation (Close-Returns)")
+    # ─────────────────────────────────────────────────────────────
+    # 🔗 Portfolio-Korrelation (Close-Returns)
+    # ─────────────────────────────────────────────────────────────
+    st.markdown("### 🔗 Portfolio-Korrelation (Close-Returns)")
 
-        price_series = []
-        for tk, dfbt in all_dfs.items():
-            if isinstance(dfbt, pd.DataFrame) and "Close" in dfbt.columns and len(dfbt) >= 3:
-                s = dfbt["Close"].copy()
-                s.name = tk
-        
-                # ✅ Index robust machen: tz entfernen + auf Tagesdatum normalisieren
-                idx = s.index
-                try:
-                    if getattr(idx, "tz", None) is not None:
-                        s.index = idx.tz_localize(None)
-                except Exception:
-                    pass
-                s.index = pd.to_datetime(s.index).normalize()
-        
-                price_series.append(s)
-        
-        if len(price_series) < 2:
-            st.info("Mindestens zwei Ticker mit Daten nötig.")
+    price_series = []
+    for tk, dfbt in all_dfs.items():
+        if isinstance(dfbt, pd.DataFrame) and "Close" in dfbt.columns and len(dfbt) >= 3:
+            s = dfbt["Close"].copy()
+            s.name = tk
+            idx = s.index
+            try:
+                if getattr(idx, "tz", None) is not None:
+                    s.index = idx.tz_localize(None)
+            except Exception:
+                pass
+            s.index = pd.to_datetime(s.index).normalize()
+            price_series.append(s)
+
+    if len(price_series) < 2:
+        st.info("Mindestens zwei Ticker mit Daten nötig.")
+    else:
+        prices = pd.concat(price_series, axis=1, join="outer").sort_index()
+        rets = prices.pct_change()
+
+        common_points = int((rets.notna().sum(axis=1) >= 2).sum())
+        corr = rets.corr(method="pearson", min_periods=60)
+
+        vals = corr.values
+        off = vals[np.triu_indices_from(vals, k=1)]
+        off = off[np.isfinite(off)]
+
+        if common_points == 0 or off.size == 0:
+            c1c, c2c, c3c, c4c = st.columns(4)
+            c1c.metric("Ø Paar-Korrelation", "–")
+            c2c.metric("Median", "–")
+            c3c.metric("Streuung (σ)", "–")
+            c4c.metric("Portfolio-Korrelation (normiert)", "–")
+            st.caption("Basis: 0 gemeinsame Zeitpunkte · Frequenz: täglich · Methode: Pearson")
         else:
-            # ✅ nicht join="inner" (zu streng), sondern Union und später Overlap prüfen
-            prices = pd.concat(price_series, axis=1, join="outer").sort_index()
-        
-            # Returns
-            rets = prices.pct_change()
-        
-            # Anzahl gemeinsamer Zeitpunkte (mind. 2 Assets mit Return vorhanden)
-            common_points = int((rets.notna().sum(axis=1) >= 2).sum())
-        
-            # Pearson-Korrelation (pairwise), min overlap damit nicht alles NaN wird
-            corr = rets.corr(method="pearson", min_periods=60)
-        
-            # KPIs aus Off-Diagonal, nur finite Werte
-            vals = corr.values
-            off = vals[np.triu_indices_from(vals, k=1)]
-            off = off[np.isfinite(off)]
-        
-            if common_points == 0 or off.size == 0:
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Ø Paar-Korrelation", "–")
-                c2.metric("Median", "–")
-                c3.metric("Streuung (σ)", "–")
-                c4.metric("Portfolio-Korrelation (normiert)", "–")
-                st.caption("Basis: 0 gemeinsame Zeitpunkte · Frequenz: täglich · Methode: Pearson")
-            else:
-                avg_corr    = float(off.mean())
-                median_corr = float(np.median(off))
-                std_corr    = float(off.std(ddof=0))
-        
-                # Portfolio-Korrelation (equal-weight, normiert) nur wenn corr voll genug ist
-                n = corr.shape[0]
-                w = np.ones(n) / n
-                port_corr = float(w @ np.nan_to_num(corr.values, nan=0.0) @ w)
-        
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Ø Paar-Korrelation", f"{avg_corr:.2f}")
-                c2.metric("Median", f"{median_corr:.2f}")
-                c3.metric("Streuung (σ)", f"{std_corr:.2f}")
-                c4.metric("Portfolio-Korrelation (normiert)", f"{port_corr:.2f}")
-        
-                st.caption(f"Basis: {common_points} gemeinsame Zeitpunkte · Frequenz: täglich · Methode: Pearson")
-        
-                fig_corr = px.imshow(
-                    corr,
-                    text_auto=".2f",
-                    aspect="auto",
-                    color_continuous_scale="RdBu",
-                    zmin=-1, zmax=1
-                )
-                fig_corr.update_layout(
-                    height=650,
-                    margin=dict(t=40, l=80, r=30, b=120),
-                    coloraxis_colorbar=dict(title="ρ")
-                )
-                fig_corr.update_xaxes(tickangle=45, automargin=True)
-                fig_corr.update_yaxes(automargin=True)
-        
-                st.plotly_chart(fig_corr, use_container_width=True)
+            avg_corr    = float(off.mean())
+            median_corr = float(np.median(off))
+            std_corr    = float(off.std(ddof=0))
 
+            n = corr.shape[0]
+            w = np.ones(n) / n
+            port_corr = float(w @ corr.values @ w) if np.isfinite(corr.values).all() else float("nan")
 
+            c1c, c2c, c3c, c4c = st.columns(4)
+            c1c.metric("Ø Paar-Korrelation", f"{avg_corr:.2f}")
+            c2c.metric("Median", f"{median_corr:.2f}")
+            c3c.metric("Streuung (σ)", f"{std_corr:.2f}")
+            c4c.metric("Portfolio-Korrelation (normiert)", "–" if not np.isfinite(port_corr) else f"{port_corr:.2f}")
 
-        # ─────────────────────────────────────────────────────────────
-        # Portfolio (Equal-Weight) – Close-to-Close Performance
-        # ─────────────────────────────────────────────────────────────
-        st.markdown("### 📈 Portfolio – Equal-Weight Performance (Close-to-Close)")
+            st.caption(f"Basis: {common_points} gemeinsame Zeitpunkte · Frequenz: täglich · Methode: Pearson")
 
-        price_series = []
-        for tk, dfbt in all_dfs.items():
-            if isinstance(dfbt, pd.DataFrame) and "Close" in dfbt.columns and len(dfbt) >= 2:
-                s = dfbt["Close"].copy()
-                s.name = tk
-                price_series.append(s)
-
-        if len(price_series) < 2:
-            st.info("Portfolio-Analytics: Mindestens zwei Ticker mit Close-Daten nötig.")
-        else:
-            prices = pd.concat(price_series, axis=1, join="outer").sort_index()
-            rets = prices.pct_change()
-
-            # Equal-Weight (tägliches Rebalancing) – nur Tage nutzen, wo mind. 2 Assets Returns haben
-            valid = rets.notna().sum(axis=1) >= 2
-            rets2 = rets.loc[valid].copy()
-
-            w = np.ones(rets2.shape[1], dtype=float) / rets2.shape[1]
-            port_ret = rets2.mul(w, axis=1).sum(axis=1).dropna()
-
-            # Kennzahlen (einfach & stabil)
-            ann_return = (1.0 + port_ret).prod() ** (252 / max(len(port_ret), 1)) - 1.0
-            ann_vol = port_ret.std(ddof=0) * np.sqrt(252)
-            sharpe = (port_ret.mean() / (port_ret.std(ddof=0) + 1e-12)) * np.sqrt(252)
-
-            nav0 = float(INIT_CAP_PER_TICKER) * len(summary_df)
-            nav = nav0 * (1.0 + port_ret).cumprod()
-            dd = (nav / nav.cummax()) - 1.0
-            max_dd = float(dd.min())
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Ø Return p.a.", f"{ann_return*100:.2f}%")
-            c2.metric("Vol p.a.", f"{ann_vol*100:.2f}%")
-            c3.metric("Sharpe", f"{sharpe:.2f}")
-            c4.metric("Max Drawdown", f"{max_dd*100:.2f}%")
-
-            fig_nav = go.Figure()
-            fig_nav.add_trace(go.Scatter(x=nav.index, y=nav.values, mode="lines", name="Portfolio NAV"))
-            fig_nav.update_layout(height=380, title="Portfolio NAV (Equal-Weight, Close-to-Close)",
-                                  xaxis_title="Datum", yaxis_title="NAV (€)",
-                                  margin=dict(t=45, b=30, l=40, r=20))
-            st.plotly_chart(fig_nav, use_container_width=True)
-
-            st.download_button(
-                "Portfolio-Returns (daily) als CSV",
-                to_csv_eu(pd.DataFrame({"Date": port_ret.index, "PortfolioRet": port_ret.values})),
-                file_name="portfolio_returns_daily.csv",
-                mime="text/csv",
+            fig_corr = px.imshow(
+                corr,
+                text_auto=".2f",
+                aspect="auto",
+                color_continuous_scale="RdBu",
+                zmin=-1, zmax=1
             )
+            fig_corr.update_layout(
+                height=650,
+                margin=dict(t=40, l=80, r=30, b=120),
+                coloraxis_colorbar=dict(title="ρ")
+            )
+            fig_corr.update_xaxes(tickangle=45, automargin=True)
+            fig_corr.update_yaxes(automargin=True)
+            st.plotly_chart(fig_corr, use_container_width=True)
+
+    # ─────────────────────────────────────────────────────────────
+    # 📈 Portfolio – Equal-Weight Performance (Close-to-Close)
+    # ─────────────────────────────────────────────────────────────
+    st.markdown("### 📈 Portfolio – Equal-Weight Performance (Close-to-Close)")
+
+    price_series = []
+    for tk, dfbt in all_dfs.items():
+        if isinstance(dfbt, pd.DataFrame) and "Close" in dfbt.columns and len(dfbt) >= 2:
+            s = dfbt["Close"].copy()
+            s.name = tk
+            idx = s.index
+            try:
+                if getattr(idx, "tz", None) is not None:
+                    s.index = idx.tz_localize(None)
+            except Exception:
+                pass
+            s.index = pd.to_datetime(s.index).normalize()
+            price_series.append(s)
+
+    if len(price_series) < 2:
+        st.info("Portfolio-Analytics: Mindestens zwei Ticker mit Close-Daten nötig.")
+    else:
+        prices = pd.concat(price_series, axis=1, join="outer").sort_index()
+        rets = prices.pct_change()
+
+        valid = rets.notna().sum(axis=1) >= 2
+        rets2 = rets.loc[valid].copy()
+
+        if rets2.empty:
+            st.info("Portfolio-Returns sind leer (zu wenig Overlap).")
+        else:
+            # ✅ tägliche Renormalisierung der Gewichte (kein Cash-Drag durch NaNs)
+            w_row = rets2.notna().astype(float)
+            w_row = w_row.div(w_row.sum(axis=1), axis=0)
+            port_ret = (rets2.fillna(0.0) * w_row).sum(axis=1).dropna()
+
+            if port_ret.empty:
+                st.info("Portfolio-Returns sind leer (nach Renormalisierung).")
+            else:
+                ann_return = (1.0 + port_ret).prod() ** (252 / len(port_ret)) - 1.0
+                ann_vol = port_ret.std(ddof=0) * np.sqrt(252)
+                sharpe = (port_ret.mean() / (port_ret.std(ddof=0) + 1e-12)) * np.sqrt(252)
+
+                nav0 = float(INIT_CAP_PER_TICKER) * len(summary_df)
+                nav = nav0 * (1.0 + port_ret).cumprod()
+                dd = (nav / nav.cummax()) - 1.0
+                max_dd = float(dd.min())
+
+                c1p, c2p, c3p, c4p = st.columns(4)
+                c1p.metric("Ø Return p.a.", f"{ann_return*100:.2f}%")
+                c2p.metric("Vol p.a.", f"{ann_vol*100:.2f}%")
+                c3p.metric("Sharpe", f"{sharpe:.2f}")
+                c4p.metric("Max Drawdown", f"{max_dd*100:.2f}%")
+
+                fig_nav = go.Figure()
+                fig_nav.add_trace(go.Scatter(x=nav.index, y=nav.values, mode="lines", name="Portfolio NAV"))
+                fig_nav.update_layout(
+                    height=380,
+                    title="Portfolio NAV (Equal-Weight, Close-to-Close)",
+                    xaxis_title="Datum", yaxis_title="NAV (€)",
+                    margin=dict(t=45, b=30, l=40, r=20)
+                )
+                st.plotly_chart(fig_nav, use_container_width=True)
+
+                st.download_button(
+                    "Portfolio-Returns (daily) als CSV",
+                    to_csv_eu(pd.DataFrame({"Date": port_ret.index, "PortfolioRet": port_ret.values})),
+                    file_name="portfolio_returns_daily.csv",
+                    mime="text/csv",
+                )
 
 else:
     st.warning("Noch keine Ergebnisse verfügbar. Prüfe Ticker-Eingaben und Datenabdeckung.")
