@@ -1,11 +1,8 @@
 # streamlit_app.py
 # ─────────────────────────────────────────────────────────────
-# NEW LEVEL 2nd Modell – Signal-basierte Strategie (Full Version)
+# NEW LEVEL 2ND MODELL – Signal-basierte Strategie (Full Version)
 # pro Ticker separates Konto + robuste Loader + saubere Fixes
-# - Loader: as_completed (korrekte Future→Ticker Zuordnung)
-# - Target: FutureRetExec passend zu "Next Open"
-# - Portfolio: Equal-Weight täglich renormalisiert (kein Cash-Drag durch NaNs)
-# - Korrelation: tz/remove + normalize + realistische Overlap-Basis
+# + 7-Tage Portfolio Forecast (Backtest-basiert) inkl. MC-Band
 # ─────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────
@@ -32,10 +29,11 @@ from sklearn.pipeline import Pipeline
 import plotly.graph_objects as go
 import plotly.express as px
 
-st.set_page_config(page_title="NEW LEVEL 2ND AI-MODELL", layout="wide")
+st.set_page_config(page_title="NEXT LEVEL 2ND AI-MODELL", layout="wide")
 LOCAL_TZ = ZoneInfo("Europe/Zurich")
 MAX_WORKERS = 6  # yfinance rate-limit sensibel: ggf. 2-4
 pd.options.display.float_format = "{:,.4f}".format
+
 
 # ─────────────────────────────────────────────────────────────
 # Helpers (CSV zuerst wegen früher Nutzung)
@@ -182,6 +180,11 @@ use_chain_live = st.sidebar.checkbox("Live-Optionskette je Aktie nutzen (PCR/VOI
 atm_band_pct   = st.sidebar.slider("ATM-Band (±%)", 1, 15, 5, step=1) / 100.0
 max_days_to_exp= st.sidebar.slider("Max. Restlaufzeit (Tage)", 7, 45, 21, step=1)
 n_expiries     = st.sidebar.slider("Nächste n Verfälle", 1, 4, 2, step=1)
+
+# ✅ Forecast (Backtest-basiert)
+st.sidebar.markdown("**Portfolio Forecast (Backtest-basiert)**")
+FORECAST_DAYS = st.sidebar.number_input("Forecast Horizon (Tage)", 1, 30, 7, step=1)
+MC_SIMS = st.sidebar.number_input("MC Simulationen", 200, 5000, 1500, step=100)
 
 # Housekeeping
 c1, c2 = st.sidebar.columns(2)
@@ -811,6 +814,67 @@ def compute_round_trips(all_trades: Dict[str, List[dict]]) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────
+# ✅ Forecast Helpers (Backtest-basiert)
+# ─────────────────────────────────────────────────────────────
+def _safe_mean(x: pd.Series) -> float:
+    x = pd.to_numeric(x, errors="coerce").dropna()
+    return float(x.mean()) if len(x) else float("nan")
+
+
+def estimate_expected_return_from_backtest(feat: pd.DataFrame, forecast_days: int, threshold: float) -> dict:
+    """
+    Schätzt erwartete Rendite über forecast_days aus historischer (Open->Open) Realisation
+    + aktueller SignalProb (Mixture: p*mu1 + (1-p)*mu0).
+    """
+    if feat is None or feat.empty or "Open" not in feat.columns or "SignalProb" not in feat.columns:
+        return {}
+
+    future_ret = feat["Open"].shift(-int(forecast_days)) / feat["Open"].shift(-1) - 1
+    tmp = pd.DataFrame({"FutureRet": future_ret}).dropna()
+    if tmp.empty:
+        return {}
+
+    tmp["TargetF"] = (tmp["FutureRet"] > float(threshold)).astype(int)
+    mu1 = _safe_mean(tmp.loc[tmp["TargetF"] == 1, "FutureRet"])
+    mu0 = _safe_mean(tmp.loc[tmp["TargetF"] == 0, "FutureRet"])
+
+    p = float(pd.to_numeric(feat["SignalProb"].iloc[-1], errors="coerce"))
+    exp_ret = p * mu1 + (1.0 - p) * mu0
+
+    return {"mu1": mu1, "mu0": mu0, "p": p, "exp_ret": exp_ret}
+
+
+def portfolio_forecast_mc(exp_rets: pd.Series, cov: pd.DataFrame, nav0: float, sims: int = 1500, seed: int = 42) -> dict:
+    tickers = exp_rets.index.tolist()
+    cov = cov.reindex(index=tickers, columns=tickers).fillna(0.0)
+
+    w = np.ones(len(tickers), dtype=float) / max(len(tickers), 1)
+
+    rng = np.random.default_rng(int(seed))
+    try:
+        draws = rng.multivariate_normal(mean=exp_rets.values, cov=cov.values, size=int(sims))
+    except Exception:
+        diag = np.diag(np.maximum(np.diag(cov.values), 0.0))
+        draws = rng.multivariate_normal(mean=exp_rets.values, cov=diag, size=int(sims))
+
+    port_rets = draws @ w
+    nav_paths = nav0 * (1.0 + port_rets)
+
+    q = np.quantile(port_rets, [0.05, 0.50, 0.95])
+    q_nav = np.quantile(nav_paths, [0.05, 0.50, 0.95])
+
+    return {
+        "port_ret_q05": float(q[0]),
+        "port_ret_q50": float(q[1]),
+        "port_ret_q95": float(q[2]),
+        "nav_q05": float(q_nav[0]),
+        "nav_q50": float(q_nav[1]),
+        "nav_q95": float(q_nav[2]),
+        "port_rets": port_rets,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
 # 🧭 Parameter-Optimierung (Random Search mit Walk-Forward-Light)
 # ─────────────────────────────────────────────────────────────
 st.subheader("🧭 Parameter-Optimierung")
@@ -939,7 +1003,7 @@ with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=Fa
 # ─────────────────────────────────────────────────────────────
 # Haupt – Pipeline
 # ─────────────────────────────────────────────────────────────
-st.markdown("<h1 style='font-size: 36px;'>📈 NEW LEVEL 2ND AI-MODELL</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='font-size: 36px;'>📈 NEXT LEVEL 2ND AI-MODELL</h1>", unsafe_allow_html=True)
 
 results = []
 all_trades: Dict[str, List[dict]] = {}
@@ -1207,7 +1271,7 @@ if live_forecasts_run:
 
 
 # ─────────────────────────────────────────────────────────────
-# Summary / Open Positions / Round-Trips / Histogramme / Korrelation / Portfolio
+# Summary / Open Positions / Round-Trips / Histogramme / Korrelation / Portfolio / Forecast
 # ─────────────────────────────────────────────────────────────
 if results:
     summary_df = pd.DataFrame(results).set_index("Ticker")
@@ -1311,169 +1375,28 @@ if results:
         st.download_button("Round-Trips als CSV", to_csv_eu(rt_df), file_name="round_trips.csv", mime="text/csv")
 
         st.markdown("### 📊 Verteilung der Round-Trip-Ergebnisse")
-
-        # Slider
         bins = st.slider("Anzahl Bins", 10, 100, 30, step=5, key="rt_bins")
-        
-        # Daten robust casten
+
         ret = pd.to_numeric(rt_df.get("Return (%)"), errors="coerce").dropna()
         pnl = pd.to_numeric(rt_df.get("PnL Net (€)"), errors="coerce").dropna()
-        
-        n_trades = int(len(ret))
-        winrate = float((ret > 0).mean() * 100) if n_trades else np.nan
-        mean_ret = float(ret.mean()) if n_trades else np.nan
-        median_ret = float(ret.median()) if n_trades else np.nan
-        std_ret = float(ret.std(ddof=0)) if n_trades else np.nan
-        
-        # KPIs oben (wie in deinem Screenshot)
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Anzahl", f"{n_trades}")
-        k2.metric("Winrate", "–" if not np.isfinite(winrate) else f"{winrate:.2f}%")
-        k3.metric("Ø Return", "–" if not np.isfinite(mean_ret) else f"{mean_ret:.2f}%")
-        k4.metric("Median", "–" if not np.isfinite(median_ret) else f"{median_ret:.2f}%")
-        k5.metric("Std-Abw.", "–" if not np.isfinite(std_ret) else f"{std_ret:.2f}%")
-        
+
         col_h1, col_h2 = st.columns(2)
-        
-        # Histogramm Return (%)
         with col_h1:
             if ret.empty:
                 st.info("Keine Return-Werte vorhanden.")
             else:
-                fig_ret = go.Figure()
-                fig_ret.add_trace(go.Histogram(x=ret, nbinsx=bins, name="Return (%)", marker_line_width=0))
-        
-                # Linien: Mean & Median (wie Screenshot)
-                if np.isfinite(mean_ret):
-                    fig_ret.add_vline(
-                        x=mean_ret, line_dash="dot", line_width=2,
-                        annotation_text="Ø", annotation_position="top"
-                    )
-                if np.isfinite(median_ret):
-                    fig_ret.add_vline(
-                        x=median_ret, line_dash="dash", line_width=2,
-                        annotation_text="Median", annotation_position="top"
-                    )
-        
-                # Optional: 0-Linie
-                fig_ret.add_vline(x=0, line_dash="dash", opacity=0.4)
-        
-                fig_ret.update_layout(
-                    title="Histogramm: Return (%)",
-                    xaxis_title="Return (%)",
-                    yaxis_title="Häufigkeit",
-                    height=380,
-                    showlegend=False,
-                    margin=dict(t=50, b=40, l=40, r=20),
-                )
+                fig_ret = go.Figure(go.Histogram(x=ret, nbinsx=bins, marker_line_width=0))
+                fig_ret.add_vline(x=0, line_dash="dash", opacity=0.5)
+                fig_ret.update_layout(title="Histogramm: Return (%)", height=360, showlegend=False)
                 st.plotly_chart(fig_ret, use_container_width=True)
-        
-        # Histogramm PnL Net (€)
         with col_h2:
             if pnl.empty:
                 st.info("Keine PnL-Werte vorhanden.")
             else:
-                mean_pnl = float(pnl.mean()) if len(pnl) else np.nan
-                median_pnl = float(pnl.median()) if len(pnl) else np.nan
-        
-                fig_pnl = go.Figure()
-                fig_pnl.add_trace(go.Histogram(x=pnl, nbinsx=bins, name="PnL Net (€)", marker_line_width=0))
-        
-                if np.isfinite(mean_pnl):
-                    fig_pnl.add_vline(
-                        x=mean_pnl, line_dash="dot", line_width=2,
-                        annotation_text="Ø", annotation_position="top"
-                    )
-                if np.isfinite(median_pnl):
-                    fig_pnl.add_vline(
-                        x=median_pnl, line_dash="dash", line_width=2,
-                        annotation_text="Median", annotation_position="top"
-                    )
-        
-                fig_pnl.add_vline(x=0, line_dash="dash", opacity=0.4)
-        
-                fig_pnl.update_layout(
-                    title="Histogramm: PnL Net (€)",
-                    xaxis_title="PnL Net (€)",
-                    yaxis_title="Häufigkeit",
-                    height=380,
-                    showlegend=False,
-                    margin=dict(t=50, b=40, l=40, r=20),
-                )
+                fig_pnl = go.Figure(go.Histogram(x=pnl, nbinsx=bins, marker_line_width=0))
+                fig_pnl.add_vline(x=0, line_dash="dash", opacity=0.5)
+                fig_pnl.update_layout(title="Histogramm: PnL Net (€)", height=360, showlegend=False)
                 st.plotly_chart(fig_pnl, use_container_width=True)
-
-
-    # ─────────────────────────────────────────────────────────────
-    # 🔗 Portfolio-Korrelation (Close-Returns)
-    # ─────────────────────────────────────────────────────────────
-    st.markdown("### 🔗 Portfolio-Korrelation (Close-Returns)")
-
-    price_series = []
-    for tk, dfbt in all_dfs.items():
-        if isinstance(dfbt, pd.DataFrame) and "Close" in dfbt.columns and len(dfbt) >= 3:
-            s = dfbt["Close"].copy()
-            s.name = tk
-            idx = s.index
-            try:
-                if getattr(idx, "tz", None) is not None:
-                    s.index = idx.tz_localize(None)
-            except Exception:
-                pass
-            s.index = pd.to_datetime(s.index).normalize()
-            price_series.append(s)
-
-    if len(price_series) < 2:
-        st.info("Mindestens zwei Ticker mit Daten nötig.")
-    else:
-        prices = pd.concat(price_series, axis=1, join="outer").sort_index()
-        rets = prices.pct_change()
-
-        common_points = int((rets.notna().sum(axis=1) >= 2).sum())
-        corr = rets.corr(method="pearson", min_periods=60)
-
-        vals = corr.values
-        off = vals[np.triu_indices_from(vals, k=1)]
-        off = off[np.isfinite(off)]
-
-        if common_points == 0 or off.size == 0:
-            c1c, c2c, c3c, c4c = st.columns(4)
-            c1c.metric("Ø Paar-Korrelation", "–")
-            c2c.metric("Median", "–")
-            c3c.metric("Streuung (σ)", "–")
-            c4c.metric("Portfolio-Korrelation (normiert)", "–")
-            st.caption("Basis: 0 gemeinsame Zeitpunkte · Frequenz: täglich · Methode: Pearson")
-        else:
-            avg_corr    = float(off.mean())
-            median_corr = float(np.median(off))
-            std_corr    = float(off.std(ddof=0))
-
-            n = corr.shape[0]
-            w = np.ones(n) / n
-            port_corr = float(w @ corr.values @ w) if np.isfinite(corr.values).all() else float("nan")
-
-            c1c, c2c, c3c, c4c = st.columns(4)
-            c1c.metric("Ø Paar-Korrelation", f"{avg_corr:.2f}")
-            c2c.metric("Median", f"{median_corr:.2f}")
-            c3c.metric("Streuung (σ)", f"{std_corr:.2f}")
-            c4c.metric("Portfolio-Korrelation (normiert)", "–" if not np.isfinite(port_corr) else f"{port_corr:.2f}")
-
-            st.caption(f"Basis: {common_points} gemeinsame Zeitpunkte · Frequenz: täglich · Methode: Pearson")
-
-            fig_corr = px.imshow(
-                corr,
-                text_auto=".2f",
-                aspect="auto",
-                color_continuous_scale="RdBu",
-                zmin=-1, zmax=1
-            )
-            fig_corr.update_layout(
-                height=650,
-                margin=dict(t=40, l=80, r=30, b=120),
-                coloraxis_colorbar=dict(title="ρ")
-            )
-            fig_corr.update_xaxes(tickangle=45, automargin=True)
-            fig_corr.update_yaxes(automargin=True)
-            st.plotly_chart(fig_corr, use_container_width=True)
 
     # ─────────────────────────────────────────────────────────────
     # 📈 Portfolio – Equal-Weight Performance (Close-to-Close)
@@ -1506,7 +1429,7 @@ if results:
         if rets2.empty:
             st.info("Portfolio-Returns sind leer (zu wenig Overlap).")
         else:
-            # ✅ tägliche Renormalisierung der Gewichte (kein Cash-Drag durch NaNs)
+            # tägliche Renormalisierung der Gewichte (kein Cash-Drag durch NaNs)
             w_row = rets2.notna().astype(float)
             w_row = w_row.div(w_row.sum(axis=1), axis=0)
             port_ret = (rets2.fillna(0.0) * w_row).sum(axis=1).dropna()
@@ -1545,6 +1468,79 @@ if results:
                     file_name="portfolio_returns_daily.csv",
                     mime="text/csv",
                 )
+
+                # ─────────────────────────────────────────────────────────────
+                # 🔮 Portfolio Forecast (nächste FORECAST_DAYS Tage)
+                # ─────────────────────────────────────────────────────────────
+                st.markdown(f"### 🔮 Portfolio-Renditeprognose (nächste {int(FORECAST_DAYS)} Tage) – Backtest-basiert")
+
+                rows_fc = []
+                for tk, feat in all_feat.items():
+                    est = estimate_expected_return_from_backtest(
+                        feat=feat,
+                        forecast_days=int(FORECAST_DAYS),
+                        threshold=float(THRESH),
+                    )
+                    if not est:
+                        continue
+                    rows_fc.append({
+                        "Ticker": tk,
+                        "Name": get_ticker_name(tk),
+                        "p (SignalProb)": est["p"],
+                        "μ1 (Target=1)": est["mu1"],
+                        "μ0 (Target=0)": est["mu0"],
+                        f"E[r {int(FORECAST_DAYS)}d]": est["exp_ret"],
+                    })
+
+                if not rows_fc:
+                    st.info("Forecast: Nicht genug Daten für eine robuste Schätzung.")
+                else:
+                    fc_df = pd.DataFrame(rows_fc).set_index("Ticker")
+                    st.dataframe(
+                        fc_df.sort_values(f"E[r {int(FORECAST_DAYS)}d]", ascending=False),
+                        use_container_width=True
+                    )
+
+                    exp_rets = fc_df[f"E[r {int(FORECAST_DAYS)}d]"].astype(float).dropna()
+                    exp_rets = exp_rets.reindex(prices.columns.intersection(exp_rets.index)).dropna()
+
+                    if len(exp_rets) < 2:
+                        st.info("Forecast: Für Portfolio-Band brauchst du mind. 2 Ticker mit Schätzung.")
+                    else:
+                        daily_rets = prices[exp_rets.index].pct_change().dropna(how="all")
+                        cov_daily = daily_rets.cov(min_periods=60)
+                        cov_h = cov_daily * float(FORECAST_DAYS)
+
+                        nav0_now = float(INIT_CAP_PER_TICKER) * len(summary_df)
+
+                        out = portfolio_forecast_mc(
+                            exp_rets=exp_rets,
+                            cov=cov_h,
+                            nav0=nav0_now,
+                            sims=int(MC_SIMS),
+                            seed=42
+                        )
+
+                        cA, cB, cC = st.columns(3)
+                        cA.metric("EW Expected Return", f"{exp_rets.mean()*100:.2f}%")
+                        cB.metric("Return 5% / 50% / 95%",
+                                  f"{out['port_ret_q05']*100:.2f}% / {out['port_ret_q50']*100:.2f}% / {out['port_ret_q95']*100:.2f}%")
+                        cC.metric("NAV 5% / 50% / 95%",
+                                  f"{out['nav_q05']:,.0f}€ / {out['nav_q50']:,.0f}€ / {out['nav_q95']:,.0f}€")
+
+                        fig_fc = go.Figure(go.Histogram(x=out["port_rets"]*100, nbinsx=40, marker_line_width=0))
+                        fig_fc.add_vline(x=out["port_ret_q50"]*100, line_dash="dash", opacity=0.7)
+                        fig_fc.add_vline(x=out["port_ret_q05"]*100, line_dash="dot", opacity=0.7)
+                        fig_fc.add_vline(x=out["port_ret_q95"]*100, line_dash="dot", opacity=0.7)
+                        fig_fc.update_layout(
+                            title=f"Simulierte Portfolio-Returns ({int(FORECAST_DAYS)} Tage, MC={int(MC_SIMS)})",
+                            xaxis_title="Return (%)",
+                            yaxis_title="Häufigkeit",
+                            height=360,
+                            showlegend=False,
+                            margin=dict(t=50, b=40, l=40, r=20),
+                        )
+                        st.plotly_chart(fig_fc, use_container_width=True)
 
 else:
     st.warning("Noch keine Ergebnisse verfügbar. Prüfe Ticker-Eingaben und Datenabdeckung.")
