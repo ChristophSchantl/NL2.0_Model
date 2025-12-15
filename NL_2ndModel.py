@@ -1317,29 +1317,34 @@ for ticker in TICKERS:
             st.plotly_chart(eq, use_container_width=True)
 
             # ─────────────────────────────────────────────
-            # 🧾 Trades – DETAILANSICHT (wie im alten Code)
+            # ▼ Trades (Next Open) – einklappbar
             # ─────────────────────────────────────────────
-            st.markdown("#### 🧾 Trades (Next Open)")
+            with st.expander(f"Trades (Next Open) für {ticker}", expanded=True):
             
-            trades_df = pd.DataFrame(trades)
+                trades_df = pd.DataFrame(trades)
             
-            if trades_df.empty:
-                st.info("Keine Trades für diesen Zeitraum / diese Parameter.")
-            else:
-                trades_df_disp = trades_df.copy()
-                trades_df_disp["Date"] = pd.to_datetime(trades_df_disp["Date"]).dt.strftime("%Y-%m-%d")
-                trades_df_disp = trades_df_disp.sort_values("Date")
+                if trades_df.empty:
+                    st.info("Keine Trades für diesen Zeitraum / diese Parameter.")
+                else:
+                    td = trades_df.copy()
             
-                st.dataframe(trades_df_disp, use_container_width=True)
+                    td["Date"] = pd.to_datetime(td["Date"]).dt.strftime("%d.%m.%Y")
             
-                st.download_button(
-                    "Trades als CSV",
-                    to_csv_eu(trades_df),
-                    file_name=f"trades_{ticker}.csv",
-                    mime="text/csv",
-                    key=f"dl_trades_{ticker}",
-                )
-
+                    cols = [
+                        "Ticker","Name","Date","Typ","Price","Shares",
+                        "Signal Prob","Hold (days)","PnL","CumPnL","Fees"
+                    ]
+                    td = td[cols]
+            
+                    st.dataframe(td, use_container_width=True)
+            
+                    st.download_button(
+                        "Trades als CSV",
+                        to_csv_eu(td),
+                        file_name=f"trades_{ticker}.csv",
+                        mime="text/csv",
+                        key=f"dl_trades_{ticker}",
+                    )
 
         
         except Exception as e:
