@@ -1325,72 +1325,87 @@ if results:
                 fig_pnl.update_layout(title="Histogramm: PnL Net (€)", height=360, showlegend=False)
                 st.plotly_chart(fig_pnl, use_container_width=True)
 
-        # ─────────────────────────────────────────────────────────────
-        # 🔗 Portfolio-Korrelation (wie im Screenshot)
-        # ─────────────────────────────────────────────────────────────
         st.markdown("### 🔗 Portfolio-Korrelation (Close-Returns)")
-        
-        # Close-Preise sammeln
+
         price_series = []
         for tk, dfbt in all_dfs.items():
-            if isinstance(dfbt, pd.DataFrame) and "Close" in dfbt.columns and len(dfbt) >= 2:
+            if isinstance(dfbt, pd.DataFrame) and "Close" in dfbt.columns and len(dfbt) >= 3:
                 s = dfbt["Close"].copy()
                 s.name = tk
+        
+                # ✅ Index robust machen: tz entfernen + auf Tagesdatum normalisieren
+                idx = s.index
+                try:
+                    if getattr(idx, "tz", None) is not None:
+                        s.index = idx.tz_localize(None)
+                except Exception:
+                    pass
+                s.index = pd.to_datetime(s.index).normalize()
+        
                 price_series.append(s)
         
         if len(price_series) < 2:
             st.info("Mindestens zwei Ticker mit Daten nötig.")
         else:
-            prices = pd.concat(price_series, axis=1, join="inner").sort_index()
-            rets = prices.pct_change().dropna()
+            # ✅ nicht join="inner" (zu streng), sondern Union und später Overlap prüfen
+            prices = pd.concat(price_series, axis=1, join="outer").sort_index()
         
-            # Pearson-Korrelation
-            corr = rets.corr(method="pearson")
+            # Returns
+            rets = prices.pct_change()
         
-            # ── Kennzahlen wie im Screenshot
-            corr_vals = corr.values[np.triu_indices_from(corr.values, k=1)]
+            # Anzahl gemeinsamer Zeitpunkte (mind. 2 Assets mit Return vorhanden)
+            common_points = int((rets.notna().sum(axis=1) >= 2).sum())
         
-            avg_corr   = float(np.nanmean(corr_vals))
-            median_corr= float(np.nanmedian(corr_vals))
-            std_corr   = float(np.nanstd(corr_vals))
+            # Pearson-Korrelation (pairwise), min overlap damit nicht alles NaN wird
+            corr = rets.corr(method="pearson", min_periods=60)
         
-            # Equal-Weight Portfolio-Korrelation (normiert)
-            n = corr.shape[0]
-            w = np.ones(n) / n
-            port_corr = float(w @ corr.values @ w)
+            # KPIs aus Off-Diagonal, nur finite Werte
+            vals = corr.values
+            off = vals[np.triu_indices_from(vals, k=1)]
+            off = off[np.isfinite(off)]
         
-            # ── KPIs anzeigen
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Ø Paar-Korrelation", f"{avg_corr:.2f}")
-            c2.metric("Median", f"{median_corr:.2f}")
-            c3.metric("Streuung (σ)", f"{std_corr:.2f}")
-            c4.metric("Portfolio-Korrelation (normiert)", f"{port_corr:.2f}")
+            if common_points == 0 or off.size == 0:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Ø Paar-Korrelation", "–")
+                c2.metric("Median", "–")
+                c3.metric("Streuung (σ)", "–")
+                c4.metric("Portfolio-Korrelation (normiert)", "–")
+                st.caption("Basis: 0 gemeinsame Zeitpunkte · Frequenz: täglich · Methode: Pearson")
+            else:
+                avg_corr    = float(off.mean())
+                median_corr = float(np.median(off))
+                std_corr    = float(off.std(ddof=0))
         
-            st.caption(
-                f"Basis: {len(rets)} gemeinsame Zeitpunkte · "
-                f"Frequenz: täglich · Methode: Pearson"
-            )
+                # Portfolio-Korrelation (equal-weight, normiert) nur wenn corr voll genug ist
+                n = corr.shape[0]
+                w = np.ones(n) / n
+                port_corr = float(w @ np.nan_to_num(corr.values, nan=0.0) @ w)
         
-            # ── Heatmap (optisch sehr nah an deinem Screenshot)
-            fig_corr = px.imshow(
-                corr,
-                text_auto=".2f",
-                color_continuous_scale="RdBu",
-                zmin=-1,
-                zmax=1,
-                aspect="auto"
-            )
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Ø Paar-Korrelation", f"{avg_corr:.2f}")
+                c2.metric("Median", f"{median_corr:.2f}")
+                c3.metric("Streuung (σ)", f"{std_corr:.2f}")
+                c4.metric("Portfolio-Korrelation (normiert)", f"{port_corr:.2f}")
         
-            fig_corr.update_layout(
-                height=650,
-                margin=dict(t=40, l=80, r=30, b=120),
-                coloraxis_colorbar=dict(title="ρ")
-            )
+                st.caption(f"Basis: {common_points} gemeinsame Zeitpunkte · Frequenz: täglich · Methode: Pearson")
         
-            fig_corr.update_xaxes(tickangle=45, automargin=True)
-            fig_corr.update_yaxes(automargin=True)
+                fig_corr = px.imshow(
+                    corr,
+                    text_auto=".2f",
+                    aspect="auto",
+                    color_continuous_scale="RdBu",
+                    zmin=-1, zmax=1
+                )
+                fig_corr.update_layout(
+                    height=650,
+                    margin=dict(t=40, l=80, r=30, b=120),
+                    coloraxis_colorbar=dict(title="ρ")
+                )
+                fig_corr.update_xaxes(tickangle=45, automargin=True)
+                fig_corr.update_yaxes(automargin=True)
         
-            st.plotly_chart(fig_corr, use_container_width=True)
+                st.plotly_chart(fig_corr, use_container_width=True)
+
 
 
         # ─────────────────────────────────────────────────────────────
