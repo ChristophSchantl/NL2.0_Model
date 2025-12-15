@@ -1405,11 +1405,11 @@ if results:
                                 f"E[r {int(FORECAST_DAYS)}d]"
                             ]].astype(float, errors="ignore")
                         
-                            # sortiere nach Expected Return
-                            fc_df = fc_df.sort_values(
-                                by=f"E[r {int(FORECAST_DAYS)}d]",
-                                ascending=False
-                            )
+                        # sortiere nach Expected Return
+                        fc_df = fc_df.sort_values(
+                            by=f"E[r {int(FORECAST_DAYS)}d]",
+                            ascending=False
+                        )
 
                         
                         st.dataframe(fc_df.sort_values(f"E[r {int(FORECAST_DAYS)}d]", ascending=False), use_container_width=True)
