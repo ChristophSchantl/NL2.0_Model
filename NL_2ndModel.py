@@ -2,8 +2,9 @@
 # ─────────────────────────────────────────────────────────────
 # NEW LEVEL 2ND MODELL – Signal-basierte Strategie (Full Version)
 # pro Ticker separates Konto + robuste Loader + saubere Fixes
-# + Portfolio KPIs korrekt (NAV-basiert, kein Ø CAGR Müll)
-# + 7-Tage Portfolio Forecast (Backtest-basiert) inkl. MC-Band
+# + Portfolio Forecast (Backtest-basiert) inkl. MC-Band
+# + Portfolio-Korrelation (Close-Returns) inkl. UI + Heatmap + Kennzahlen
+# + Optimizer (Random Search, Walk-Forward-Light)
 # ─────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────
@@ -32,7 +33,6 @@ import plotly.express as px
 
 st.set_page_config(page_title="NEXT LEVEL 2ND AI-MODELL", layout="wide")
 LOCAL_TZ = ZoneInfo("Europe/Zurich")
-TRADING_DAYS = 252
 MAX_WORKERS = 6  # yfinance rate-limit sensibel: ggf. 2-4
 pd.options.display.float_format = "{:,.4f}".format
 
@@ -183,7 +183,7 @@ atm_band_pct   = st.sidebar.slider("ATM-Band (±%)", 1, 15, 5, step=1) / 100.0
 max_days_to_exp= st.sidebar.slider("Max. Restlaufzeit (Tage)", 7, 45, 21, step=1)
 n_expiries     = st.sidebar.slider("Nächste n Verfälle", 1, 4, 2, step=1)
 
-# ✅ Forecast (Backtest-basiert)
+# Forecast (Backtest-basiert)
 st.sidebar.markdown("**Portfolio Forecast (Backtest-basiert)**")
 FORECAST_DAYS = st.sidebar.number_input("Forecast Horizon (Tage)", 1, 30, 7, step=1)
 MC_SIMS = st.sidebar.number_input("MC Simulationen", 200, 5000, 1500, step=100)
@@ -642,9 +642,9 @@ def _cagr_from_path(values: pd.Series) -> float:
 def _sortino(rets: pd.Series) -> float:
     if rets.empty:
         return np.nan
-    mean = rets.mean() * TRADING_DAYS
+    mean = rets.mean() * 252
     downside = rets[rets < 0]
-    dd = downside.std() * np.sqrt(TRADING_DAYS) if len(downside) else np.nan
+    dd = downside.std() * np.sqrt(252) if len(downside) else np.nan
     return mean / dd if dd and np.isfinite(dd) and dd > 0 else np.nan
 
 
@@ -668,8 +668,8 @@ def _winrate_roundtrips(trades: List[dict]) -> float:
 def compute_performance(df_bt: pd.DataFrame, trades: List[dict], init_cap: float) -> dict:
     net_ret = (df_bt["Equity_Net"].iloc[-1] / init_cap - 1) * 100
     rets = df_bt["Equity_Net"].pct_change().dropna()
-    vol_ann = rets.std() * sqrt(TRADING_DAYS) * 100
-    sharpe = (rets.mean() * sqrt(TRADING_DAYS)) / (rets.std() + 1e-12)
+    vol_ann = rets.std() * sqrt(252) * 100
+    sharpe = (rets.mean() * sqrt(252)) / (rets.std() + 1e-12)
     dd = (df_bt["Equity_Net"] - df_bt["Equity_Net"].cummax()) / df_bt["Equity_Net"].cummax()
     max_dd = dd.min() * 100
     calmar = (net_ret/100) / abs(max_dd/100) if max_dd < 0 else np.nan
@@ -764,10 +764,8 @@ def estimate_expected_return_from_backtest(feat: pd.DataFrame, forecast_days: in
     p = float(pd.to_numeric(feat["SignalProb"].iloc[-1], errors="coerce"))
     if not np.isfinite(p):
         p = 0.5
-    if not np.isfinite(mu1): mu1 = 0.0
-    if not np.isfinite(mu0): mu0 = 0.0
-
     exp_ret = p * mu1 + (1.0 - p) * mu0
+
     return {"mu1": mu1, "mu0": mu0, "p": p, "exp_ret": exp_ret}
 
 
@@ -783,19 +781,11 @@ def _ensure_psd_cov(cov: np.ndarray, eps: float = 1e-12) -> np.ndarray:
         return d
 
 
-def portfolio_forecast_mc(
-    exp_rets: pd.Series,
-    cov: pd.DataFrame,
-    nav0: float,
-    sims: int = 1500,
-    seed: int = 42
-) -> dict:
+def portfolio_forecast_mc(exp_rets: pd.Series, cov: pd.DataFrame, nav0: float, sims: int = 1500, seed: int = 42) -> dict:
     tickers = exp_rets.index.tolist()
-    cov = cov.reindex(index=tickers, columns=tickers).astype(float).fillna(0.0)
+    cov = cov.reindex(index=tickers, columns=tickers).fillna(0.0)
 
-    # Equal-weight (renormalisiert)
     w = np.ones(len(tickers), dtype=float) / max(len(tickers), 1)
-
     cov_np = _ensure_psd_cov(cov.values)
 
     rng = np.random.default_rng(int(seed))
@@ -898,54 +888,129 @@ def make_features_and_train(
 
 
 # ─────────────────────────────────────────────────────────────
-# Portfolio helpers (für echte Portfolio-KPIs)
+# 🧭 Parameter-Optimierung (Random Search mit Walk-Forward-Light)
 # ─────────────────────────────────────────────────────────────
-def build_portfolio_close_to_close_from_all_dfs(all_dfs: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.Series]:
-    """
-    Returns:
-      prices: DataFrame Close-Prices aligned (Date index normalized)
-      port_ret: Series daily portfolio return (Equal-Weight, daily renormalized on available tickers)
-    """
-    price_series = []
-    for tk, dfbt in (all_dfs or {}).items():
-        if isinstance(dfbt, pd.DataFrame) and "Close" in dfbt.columns and len(dfbt) >= 2:
-            s = dfbt["Close"].copy()
-            s.name = tk
-            idx = s.index
-            try:
-                if getattr(idx, "tz", None) is not None:
-                    s.index = idx.tz_localize(None)
-            except Exception:
-                pass
-            s.index = pd.to_datetime(s.index).normalize()
-            price_series.append(s)
+st.subheader("🧭 Parameter-Optimierung")
+with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=False):
+    n_trials = st.number_input("Trials", 10, 1000, 80, step=10)
+    seed = st.number_input("Seed", 0, 10_000, 42)
+    lambda_trades = st.number_input("Penalty λ pro Trade", 0.0, 1.0, 0.02, step=0.005)
+    min_trades_req = st.number_input("Min. Trades gesamt (Filter)", 0, 10000, 5, step=1)
 
-    if len(price_series) < 2:
-        return pd.DataFrame(), pd.Series(dtype=float)
+    lb_lo, lb_hi = st.slider("Lookback", 10, 252, (30, 120), step=5)
+    hz_lo, hz_hi = st.slider("Horizon", 1, 10, (3, 8))
+    thr_lo, thr_hi = st.slider("Threshold Target", 0.0, 0.10, (0.035, 0.10), step=0.005, format="%.3f")
+    en_lo, en_hi = st.slider("Entry Prob Range", 0.0, 1.0, (0.55, 0.85), step=0.01)
+    ex_lo, ex_hi = st.slider("Exit Prob Range", 0.0, 1.0, (0.30, 0.60), step=0.01)
 
-    prices = pd.concat(price_series, axis=1, join="outer").sort_index()
-    rets = prices.pct_change()
+    @st.cache_data(show_spinner=False)
+    def _get_prices_for_optimizer(tickers: tuple, start: str, end: str, use_tail: bool, interval: str,
+                                  fallback_last: bool, exec_key: str, moc_cutoff: int):
+        return load_all_prices(list(tickers), start, end, use_tail, interval, fallback_last, exec_key, moc_cutoff)[0]
 
-    valid = rets.notna().sum(axis=1) >= 2
-    rets2 = rets.loc[valid].copy()
-    if rets2.empty:
-        return prices, pd.Series(dtype=float)
+    def _sample_params(rng):
+        return dict(
+            lookback = rng.randrange(lb_lo, lb_hi+1, 5),
+            horizon  = rng.randrange(hz_lo, hz_hi+1, 1),
+            thresh   = rng.uniform(thr_lo, thr_hi),
+            entry    = rng.uniform(en_lo, en_hi),
+            exit     = rng.uniform(ex_lo, ex_hi),
+        )
 
-    # renormalisiert -> kein Cash-Drag durch NaNs
-    w_row = rets2.notna().astype(float)
-    w_row = w_row.div(w_row.sum(axis=1), axis=0)
-    port_ret = (rets2.fillna(0.0) * w_row).sum(axis=1).dropna()
+    if st.button("🔎 Suche starten", type="primary", use_container_width=True):
+        import random
+        rng = random.Random(int(seed))
+        price_map_opt = _get_prices_for_optimizer(
+            tuple(TICKERS), str(START_DATE), str(END_DATE),
+            use_live, intraday_interval, fallback_last_session, exec_mode, int(moc_cutoff_min)
+        )
 
-    return prices, port_ret
+        rows, best = [], None
+        prog = st.progress(0.0)
 
+        feasible_tickers = [tk for tk, df in price_map_opt.items() if df is not None and len(df) >= 80]
+        if not feasible_tickers:
+            st.warning("Keine ausreichenden Preisdaten für Optimierung.")
+        else:
+            for t in range(int(n_trials)):
+                p = _sample_params(rng)
+                if p["exit"] >= p["entry"]:
+                    prog.progress((t+1)/n_trials)
+                    continue
 
-def cagr_from_nav(nav: pd.Series) -> float:
-    if nav is None or nav.empty or len(nav) < 2:
-        return np.nan
-    dt0 = pd.to_datetime(nav.index[0])
-    dt1 = pd.to_datetime(nav.index[-1])
-    years = max((dt1 - dt0).days / 365.25, 1e-9)
-    return float((nav.iloc[-1] / nav.iloc[0]) ** (1 / years) - 1.0)
+                sharps, trades_total, feasible = [], 0, 0
+
+                for tk in feasible_tickers:
+                    df0 = price_map_opt.get(tk)
+                    if df0 is None or len(df0) < max(60, p["lookback"] + p["horizon"] + 5):
+                        continue
+                    feasible += 1
+
+                    mid = len(df0) // 2
+                    for sub in (df0.iloc[:mid], df0.iloc[mid:]):
+                        if len(sub) < max(60, p["lookback"] + p["horizon"] + 5):
+                            continue
+                        try:
+                            _, df_bt, trades, mets = make_features_and_train(
+                                sub, p["lookback"], p["horizon"], p["thresh"],
+                                MODEL_PARAMS, p["entry"], p["exit"],
+                                init_capital=float(INIT_CAP_PER_TICKER),
+                                pos_frac=float(POS_FRAC),
+                                min_hold_days=int(MIN_HOLD_DAYS),
+                                cooldown_days=int(COOLDOWN_DAYS),
+                                walk_forward=True,
+                                wf_min_train=int(wf_min_train),
+                            )
+                            sharps.append(mets["Sharpe-Ratio"])
+                            trades_total += int(mets["Number of Trades"])
+                        except Exception:
+                            pass
+
+                if feasible == 0:
+                    prog.progress((t+1)/n_trials)
+                    continue
+
+                sharpe_avg = float(np.nanmedian(sharps)) if len(sharps) else float("nan")
+                denom = max(1, feasible * 2)
+                trades_avg = trades_total / denom
+
+                if trades_total < int(min_trades_req) or not np.isfinite(sharpe_avg):
+                    prog.progress((t+1)/n_trials)
+                    continue
+
+                score = sharpe_avg - float(lambda_trades) * float(trades_avg)
+
+                rec = dict(trial=t, score=score, sharpe_avg=sharpe_avg,
+                           trades=trades_total, **p)
+                rows.append(rec)
+                if (best is None) or (score > best["score"]):
+                    best = rec
+
+                prog.progress((t+1)/n_trials)
+
+            if not rows:
+                st.warning("Keine gültigen Kandidaten gefunden.")
+            else:
+                df_res = pd.DataFrame(rows).sort_values("score", ascending=False)
+
+                mask = pd.to_numeric(df_res["trades"], errors="coerce").fillna(0).astype(int) >= int(min_trades_req)
+                df_show = df_res.loc[mask].copy()
+                if df_show.empty:
+                    df_show = df_res.copy()
+
+                st.success(f"Beste Parameter: Score={best['score']:.3f} | Sharpe={best['sharpe_avg']:.2f} | Trades={best['trades']}")
+                c1_, c2_, c3_, c4_, c5_ = st.columns(5)
+                c1_.metric("Lookback", int(best["lookback"]))
+                c2_.metric("Horizon",  int(best["horizon"]))
+                c3_.metric("Target Thresh", f"{best['thresh']:.3f}")
+                c4_.metric("Entry Prob",    f"{best['entry']:.2f}")
+                c5_.metric("Exit Prob",     f"{best['exit']:.2f}")
+
+                st.caption("Top-Ergebnisse (Score = Sharpe − λ·Trades/(Ticker·Hälften))")
+                st.dataframe(df_show.head(25), use_container_width=True)
+                st.download_button("Optimierergebnisse als CSV",
+                                   to_csv_eu(df_res),
+                                   file_name="param_search_results.csv", mime="text/csv")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1151,7 +1216,7 @@ for ticker in TICKERS:
 
 
 # ─────────────────────────────────────────────────────────────
-# Live-Forecast Board
+# 🔮 Live-Forecast Board
 # ─────────────────────────────────────────────────────────────
 if live_forecasts_run:
     live_df = (
@@ -1181,7 +1246,7 @@ if live_forecasts_run:
 
 
 # ─────────────────────────────────────────────────────────────
-# Summary / Open Positions / Portfolio / Forecast (NAV-basiert)
+# Summary / Open Positions / Round-Trips / Portfolio / Korrelation / Forecast
 # ─────────────────────────────────────────────────────────────
 if results:
     summary_df = pd.DataFrame(results).set_index("Ticker")
@@ -1202,29 +1267,9 @@ if results:
     total_trades    = int(summary_df["Number of Trades"].sum())
     total_capital   = float(INIT_CAP_PER_TICKER) * len(summary_df)
 
-    # Strategie total (per-ticker Konten) -> korrekt als Aggregation
     total_net_return_pct   = (total_net_pnl / total_capital * 100) if total_capital else np.nan
     total_gross_return_pct = (total_gross_pnl / total_capital * 100) if total_capital else np.nan
-
-    # ✅ Portfolio KPIs (Close-to-Close, Equal-Weight, renormalisiert) -> korrekt, kein Ø CAGR/BH
-    prices_port, port_ret = build_portfolio_close_to_close_from_all_dfs(all_dfs)
-
-    port_nav0 = float(INIT_CAP_PER_TICKER) * len(summary_df)
-    port_nav = pd.Series(dtype=float)
-    port_cagr = np.nan
-    port_bh_total_pct = np.nan
-    port_ann_vol = np.nan
-    port_sharpe = np.nan
-    port_max_dd = np.nan
-
-    if port_ret is not None and not port_ret.empty:
-        port_nav = port_nav0 * (1.0 + port_ret).cumprod()
-        port_cagr = cagr_from_nav(port_nav)
-        port_bh_total_pct = (port_nav.iloc[-1] / port_nav.iloc[0] - 1.0) * 100
-        port_ann_vol = port_ret.std(ddof=0) * np.sqrt(TRADING_DAYS)
-        port_sharpe = (port_ret.mean() / (port_ret.std(ddof=0) + 1e-12)) * np.sqrt(TRADING_DAYS)
-        dd = (port_nav / port_nav.cummax()) - 1.0
-        port_max_dd = float(dd.min()) if not dd.empty else np.nan
+    bh_total_pct = float(summary_df["Buy & Hold Net (%)"].dropna().mean()) if "Buy & Hold Net (%)" in summary_df.columns else float("nan")
 
     st.subheader("📊 Summary of all Tickers (Next Open Backtest) — per Ticker Konto")
     cols = st.columns(4)
@@ -1233,12 +1278,11 @@ if results:
     cols[2].metric("Cumulative Gross P&L (€)", f"{total_gross_pnl:,.2f}")
     cols[3].metric("Total Number of Trades",   f"{int(total_trades)}")
 
-    # ✅ FIX: keine Ø CAGR / keine mean(Buy&Hold) mehr
     cols_pct = st.columns(4)
     cols_pct[0].metric("Strategy Net (%) – total",   f"{total_net_return_pct:.2f}")
     cols_pct[1].metric("Strategy Gross (%) – total", f"{total_gross_return_pct:.2f}")
-    cols_pct[2].metric("Portfolio Buy&Hold (%) – total", f"{port_bh_total_pct:.2f}" if np.isfinite(port_bh_total_pct) else "–")
-    cols_pct[3].metric("Portfolio CAGR (%)", f"{port_cagr*100:.2f}" if np.isfinite(port_cagr) else "–")
+    cols_pct[2].metric("Buy & Hold Net (%) – total", f"{bh_total_pct:.2f}")
+    cols_pct[3].metric("Durchschn. CAGR (%)", f"{summary_df['CAGR (%)'].dropna().mean():.2f}" if "CAGR (%)" in summary_df else "–")
 
     def phase_style(val):
         v = str(val).strip().lower()
@@ -1263,7 +1307,6 @@ if results:
     )
     if "Phase" in summary_df.columns:
         styled_sum = styled_sum.applymap(phase_style, subset=["Phase"])
-
     show_styled_or_plain(summary_df, styled_sum)
 
     st.download_button(
@@ -1299,38 +1342,187 @@ if results:
     else:
         st.success("Keine offenen Positionen.")
 
-    # Portfolio NAV + KPIs (Close-to-Close)
+    rt_df = compute_round_trips(all_trades)
+    if not rt_df.empty:
+        st.subheader("🔁 Abgeschlossene Trades (Round-Trips)")
+        st.dataframe(rt_df.sort_values("Exit Date", ascending=False), use_container_width=True)
+        st.download_button("Round-Trips als CSV", to_csv_eu(rt_df), file_name="round_trips.csv", mime="text/csv")
+
+    # ─────────────────────────────────────────────────────────────
+    # 📈 Portfolio – Equal-Weight Performance (Close-to-Close)
+    # ─────────────────────────────────────────────────────────────
     st.markdown("### 📈 Portfolio – Equal-Weight Performance (Close-to-Close)")
-    if port_ret is None or port_ret.empty:
+
+    price_series = []
+    for tk, dfbt in all_dfs.items():
+        if isinstance(dfbt, pd.DataFrame) and "Close" in dfbt.columns and len(dfbt) >= 2:
+            s = dfbt["Close"].copy()
+            s.name = tk
+            try:
+                if getattr(s.index, "tz", None) is not None:
+                    s.index = s.index.tz_localize(None)
+            except Exception:
+                pass
+            s.index = pd.to_datetime(s.index).normalize()
+            price_series.append(s)
+
+    prices_port = pd.DataFrame()
+    port_ret = pd.Series(dtype=float)
+
+    if len(price_series) < 2:
         st.info("Portfolio-Analytics: Mindestens zwei Ticker mit Close-Daten nötig.")
     else:
-        st.caption(f"Historische NAV-Basis (Startkapital): {port_nav0:,.2f} €")
-        c1p, c2p, c3p, c4p = st.columns(4)
-        c1p.metric("Ø Return p.a.", f"{((1.0 + port_ret).prod() ** (TRADING_DAYS / len(port_ret)) - 1.0)*100:.2f}%")
-        c2p.metric("Vol p.a.", f"{port_ann_vol*100:.2f}%")
-        c3p.metric("Sharpe", f"{port_sharpe:.2f}")
-        c4p.metric("Max Drawdown", f"{port_max_dd*100:.2f}%")
+        prices_port = pd.concat(price_series, axis=1, join="outer").sort_index()
+        rets = prices_port.pct_change()
 
-        fig_nav = go.Figure()
-        fig_nav.add_trace(go.Scatter(x=port_nav.index, y=port_nav.values, mode="lines", name="Portfolio NAV"))
-        fig_nav.update_layout(
-            height=380,
-            title="Portfolio NAV (Equal-Weight, Close-to-Close)",
-            xaxis_title="Datum", yaxis_title="NAV (€)",
-            margin=dict(t=45, b=30, l=40, r=20)
-        )
-        st.plotly_chart(fig_nav, use_container_width=True)
+        valid = rets.notna().sum(axis=1) >= 2
+        rets2 = rets.loc[valid].copy()
 
-        st.download_button(
-            "Portfolio-Returns (daily) als CSV",
-            to_csv_eu(pd.DataFrame({"Date": port_ret.index, "PortfolioRet": port_ret.values})),
-            file_name="portfolio_returns_daily.csv",
-            mime="text/csv",
-        )
+        if rets2.empty:
+            st.info("Portfolio-Returns sind leer (zu wenig Overlap).")
+        else:
+            # tägliche Renormalisierung (kein Cash-Drag durch NaNs)
+            w_row = rets2.notna().astype(float)
+            w_row = w_row.div(w_row.sum(axis=1), axis=0)
+            port_ret = (rets2.fillna(0.0) * w_row).sum(axis=1).dropna()
 
-        # Forecast
-        st.markdown(f"### 🔮 Portfolio-Renditeprognose (nächste {int(FORECAST_DAYS)} Tage) – Backtest-basiert")
+            if port_ret.empty:
+                st.info("Portfolio-Returns sind leer (nach Renormalisierung).")
+            else:
+                ann_return = (1.0 + port_ret).prod() ** (252 / len(port_ret)) - 1.0
+                ann_vol = port_ret.std(ddof=0) * np.sqrt(252)
+                sharpe = (port_ret.mean() / (port_ret.std(ddof=0) + 1e-12)) * np.sqrt(252)
 
+                nav0 = float(INIT_CAP_PER_TICKER) * len(summary_df)
+                nav = nav0 * (1.0 + port_ret).cumprod()
+                dd = (nav / nav.cummax()) - 1.0
+                max_dd = float(dd.min())
+
+                c1p, c2p, c3p, c4p = st.columns(4)
+                c1p.metric("Ø Return p.a.", f"{ann_return*100:.2f}%")
+                c2p.metric("Vol p.a.", f"{ann_vol*100:.2f}%")
+                c3p.metric("Sharpe", f"{sharpe:.2f}")
+                c4p.metric("Max Drawdown", f"{max_dd*100:.2f}%")
+
+                fig_nav = go.Figure()
+                fig_nav.add_trace(go.Scatter(x=nav.index, y=nav.values, mode="lines", name="Portfolio NAV"))
+                fig_nav.update_layout(
+                    height=380,
+                    title="Portfolio NAV (Equal-Weight, Close-to-Close)",
+                    xaxis_title="Datum", yaxis_title="NAV (€)",
+                    margin=dict(t=45, b=30, l=40, r=20)
+                )
+                st.plotly_chart(fig_nav, use_container_width=True)
+
+                st.download_button(
+                    "Portfolio-Returns (daily) als CSV",
+                    to_csv_eu(pd.DataFrame({"Date": port_ret.index, "PortfolioRet": port_ret.values})),
+                    file_name="portfolio_returns_daily.csv",
+                    mime="text/csv",
+                )
+
+    # ─────────────────────────────────────────────────────────────
+    # ✅ HIER: Portfolio-Korrelation (Close-Returns) – wie Screenshot
+    # ─────────────────────────────────────────────────────────────
+    st.markdown("### 🔗 Portfolio-Korrelation (Close-Returns)")
+
+    if prices_port is None or prices_port.empty or prices_port.shape[1] < 2:
+        st.info("Korrelation: Mindestens zwei Ticker mit Close-Daten nötig.")
+    else:
+        cA, cB, cC, cD = st.columns([1.2, 1.2, 1.8, 1.0])
+
+        with cA:
+            freq_label = st.selectbox("Return-Frequenz", ["täglich", "wöchentlich", "monatlich"], index=0)
+        with cB:
+            corr_method = st.selectbox("Korrelationsmethode", ["Pearson", "Spearman", "Kendall"], index=0)
+        with cC:
+            min_obs = st.slider("Min. gemeinsame Zeitpunkte", min_value=10, max_value=300, value=20, step=5)
+        with cD:
+            use_ffill = st.checkbox("Lücken per FFill schließen", value=True)
+
+        prices_corr = prices_port.copy()
+        if use_ffill:
+            prices_corr = prices_corr.ffill()
+
+        # Resample
+        if freq_label == "täglich":
+            freq = "D"
+            prices_corr = prices_corr
+        elif freq_label == "wöchentlich":
+            freq = "W"
+            prices_corr = prices_corr.resample("W").last()
+        else:
+            freq = "M"
+            prices_corr = prices_corr.resample("M").last()
+
+        rets_corr = prices_corr.pct_change().dropna(how="all")
+
+        # Filter: ausreichende Datenpunkte je Ticker
+        counts = rets_corr.notna().sum()
+        keep = counts[counts >= int(min_obs)].index.tolist()
+        rets_corr = rets_corr[keep]
+
+        if rets_corr.shape[1] < 2 or rets_corr.empty:
+            st.warning("Zu wenig Overlap nach Filter (min. gemeinsame Zeitpunkte / FFill / Zeitraum prüfen).")
+        else:
+            corr = rets_corr.corr(method=corr_method.lower())
+
+            m = corr.values.copy()
+            np.fill_diagonal(m, np.nan)
+            off = m[np.isfinite(m)]
+
+            pair_avg = float(np.mean(off)) if off.size else float("nan")
+            pair_med = float(np.median(off)) if off.size else float("nan")
+            pair_std = float(np.std(off)) if off.size else float("nan")
+
+            # Portfolio-Korrelation (normiert, Equal-Weight)
+            cov = rets_corr.cov()
+            vols = np.sqrt(np.diag(cov.values))
+            n = len(vols)
+            w = np.ones(n) / n
+            port_var = float(w @ cov.values @ w)
+
+            denom = float(np.sum(w[:, None] * w[None, :] * vols[:, None] * vols[None, :])) + 1e-12
+            diag_part = float(np.sum((w**2) * (vols**2)))
+            port_corr_norm = (port_var - diag_part) / denom
+
+            st.caption(
+                f"Basis: {len(rets_corr)} gemeinsame Zeitpunkte · Frequenz: {freq_label} · Methode: {corr_method}"
+            )
+
+            fig_corr = px.imshow(
+                corr.round(2),
+                text_auto=True,
+                aspect="auto",
+                color_continuous_scale="RdBu",
+                zmin=-1,
+                zmax=1,
+                title="Korrelationsmatrix (Close-Returns)",
+            )
+            fig_corr.update_layout(height=520, margin=dict(t=55, b=30, l=40, r=20))
+            st.plotly_chart(fig_corr, use_container_width=True)
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Ø Paar-Korrelation", f"{pair_avg:.2f}" if np.isfinite(pair_avg) else "–")
+            k2.metric("Median", f"{pair_med:.2f}" if np.isfinite(pair_med) else "–")
+            k3.metric("Streuung (σ)", f"{pair_std:.2f}" if np.isfinite(pair_std) else "–")
+            k4.metric("Portfolio-Korrelation (normiert)", f"{port_corr_norm:.2f}" if np.isfinite(port_corr_norm) else "–")
+
+            st.download_button(
+                "Korrelationsmatrix als CSV",
+                to_csv_eu(corr.reset_index().rename(columns={"index": "Ticker"})),
+                file_name="portfolio_correlation_matrix.csv",
+                mime="text/csv",
+            )
+
+    # ─────────────────────────────────────────────────────────────
+    # 🔮 Portfolio Forecast (nächste FORECAST_DAYS Tage)
+    # ─────────────────────────────────────────────────────────────
+    st.markdown(f"### 🔮 Portfolio-Renditeprognose (nächste {int(FORECAST_DAYS)} Tage) – Backtest-basiert")
+
+    if prices_port is None or prices_port.empty:
+        st.info("Forecast: Keine Portfolio-Preisdaten verfügbar.")
+    else:
         rows_fc = []
         for tk, feat in all_feat.items():
             est = estimate_expected_return_from_backtest(
@@ -1359,10 +1551,7 @@ if results:
             )
 
             exp_rets = fc_df[f"E[r {int(FORECAST_DAYS)}d]"].astype(float).dropna()
-
-            # nur Schnittmenge zur Portfolio-Price-Matrix
-            if prices_port is not None and not prices_port.empty:
-                exp_rets = exp_rets.reindex(prices_port.columns.intersection(exp_rets.index)).dropna()
+            exp_rets = exp_rets.reindex(prices_port.columns.intersection(exp_rets.index)).dropna()
 
             if len(exp_rets) < 2:
                 st.info("Forecast: Für Portfolio-Band brauchst du mind. 2 Ticker mit Schätzung.")
@@ -1371,8 +1560,7 @@ if results:
                 cov_daily = daily_rets.cov(min_periods=60)
                 cov_h = cov_daily * float(FORECAST_DAYS)
 
-                # ✅ NAV-Basis = aktueller NAV (nicht Startkapital)
-                nav0_now = float(port_nav.iloc[-1]) if (port_nav is not None and not port_nav.empty) else float(port_nav0)
+                nav0_now = float(INIT_CAP_PER_TICKER) * len(summary_df)
 
                 out = portfolio_forecast_mc(
                     exp_rets=exp_rets,
