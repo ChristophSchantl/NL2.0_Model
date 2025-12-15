@@ -4,7 +4,7 @@
 # pro Ticker separates Konto + robuste Loader + saubere Fixes
 # + Portfolio Forecast (Backtest-basiert) inkl. MC-Band
 # + Portfolio-Korrelation (Close-Returns) inkl. UI + Heatmap + Kennzahlen
-# + Optimizer (Random Search, Walk-Forward-Light)
+# + Optimizer (Random Search, Walk-Forward-Light) — FIX: Feature-Cache + Prefilter + schneller Eval
 # ─────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────
@@ -521,6 +521,19 @@ def make_features(df: pd.DataFrame, lookback: int, horizon: int, exog: Optional[
 
 
 # ─────────────────────────────────────────────────────────────
+# ✅ Optimizer-Speedup: Feature-Cache (pro df/params) für Random Search
+# ─────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False, ttl=3600)
+def build_feature_cache(df: pd.DataFrame, lookback: int, horizon: int, threshold: float):
+    feat = make_features(df, lookback, horizon)
+    hist = feat.iloc[:-1].dropna(subset=["FutureRetExec"]).copy()
+    if hist.empty:
+        return None, None
+    hist["Target"] = (hist["FutureRetExec"] > threshold).astype(int)
+    return feat, hist
+
+
+# ─────────────────────────────────────────────────────────────
 # Backtest (Next Open) – pro Ticker separates Konto
 # ─────────────────────────────────────────────────────────────
 def backtest_next_open(
@@ -910,8 +923,8 @@ with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=Fa
 
     def _sample_params(rng):
         return dict(
-            lookback = rng.randrange(lb_lo, lb_hi+1, 5),
-            horizon  = rng.randrange(hz_lo, hz_hi+1, 1),
+            lookback = rng.randrange(lb_lo, lb_hi + 1, 5),
+            horizon  = rng.randrange(hz_lo, hz_hi + 1, 1),
             thresh   = rng.uniform(thr_lo, thr_hi),
             entry    = rng.uniform(en_lo, en_hi),
             exit     = rng.uniform(ex_lo, ex_hi),
@@ -920,86 +933,101 @@ with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=Fa
     if st.button("🔎 Suche starten", type="primary", use_container_width=True):
         import random
         from collections import Counter
-    
+
         rng = random.Random(int(seed))
         price_map_opt = _get_prices_for_optimizer(
             tuple(TICKERS), str(START_DATE), str(END_DATE),
             use_live, intraday_interval, fallback_last_session, exec_mode, int(moc_cutoff_min)
         )
-    
-        feasible_tickers = [tk for tk, df in price_map_opt.items() if isinstance(df, pd.DataFrame) and len(df) >= 80]
-        if not feasible_tickers:
-            st.warning("Keine ausreichenden Preisdaten für Optimierung.")
+
+        # ✅ Prefilter (spart massiv Zeit & Fehler im Optimizer)
+        prefiltered: Dict[str, pd.DataFrame] = {}
+        min_len_need = max(120, int(wf_min_train) + 40)
+        for tk, df in (price_map_opt or {}).items():
+            if not isinstance(df, pd.DataFrame):
+                continue
+            if len(df) < min_len_need:
+                continue
+            prefiltered[tk] = df.copy()
+
+        if len(prefiltered) < 2:
+            st.error("Optimizer: zu wenige Ticker nach Prefilter.")
             st.stop()
-    
+
+        feasible_tickers = list(prefiltered.keys())
+
+        # ✅ Schneller Eval: Cache-Features + nur 2-Split WF-light (ohne make_features_and_train Overhead)
         def _eval_one(df0: pd.DataFrame, p: dict) -> tuple:
-            # dynamisch: WalkForward braucht schlicht mehr Bars
-            wf_need = max(int(wf_min_train), int(p["lookback"]) + int(p["horizon"]) + 30)
-            if len(df0) < wf_need + 10:
-                raise ValueError(f"Zu wenig Daten: need~{wf_need}, have={len(df0)}")
-    
-            # 2-Hälften WalkForward-Light
-            mid = len(df0) // 2
-            parts = [df0.iloc[:mid], df0.iloc[mid:]]
+            # Feature-Cache (pro df/params)
+            feat, hist = build_feature_cache(
+                df0,
+                int(p["lookback"]),
+                int(p["horizon"]),
+                float(p["thresh"]),
+            )
+            if feat is None or hist is None or hist["Target"].nunique() < 2:
+                raise ValueError("Feature cache leer / Target degeneriert")
+
+            X_cols = ["Range", "SlopeHigh", "SlopeLow"]
+
+            pipe = Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("model", GradientBoostingClassifier(**MODEL_PARAMS)),
+            ])
+
+            mid = len(hist) // 2
             sharps = []
             trades_sum = 0
             valid_parts = 0
-    
-            for sub in parts:
-                wf_need_sub = max(int(wf_min_train), int(p["lookback"]) + int(p["horizon"]) + 30)
-                if len(sub) < wf_need_sub + 10:
+
+            for sub in (hist.iloc[:mid], hist.iloc[mid:]):
+                if len(sub) < int(wf_min_train):
                     continue
-    
-                _, _, _, mets = make_features_and_train(
-                    sub, int(p["lookback"]), int(p["horizon"]), float(p["thresh"]),
-                    MODEL_PARAMS, float(p["entry"]), float(p["exit"]),
-                    init_capital=float(INIT_CAP_PER_TICKER),
-                    pos_frac=float(POS_FRAC),
+
+                pipe.fit(sub[X_cols], sub["Target"])
+                feat["SignalProb"] = pipe.predict_proba(feat[X_cols])[:, 1]
+
+                df_bt, trades = backtest_next_open(
+                    feat.iloc[:-1],
+                    float(p["entry"]), float(p["exit"]),
+                    COMMISSION, SLIPPAGE_BPS,
+                    float(INIT_CAP_PER_TICKER),
+                    float(POS_FRAC),
                     min_hold_days=int(MIN_HOLD_DAYS),
                     cooldown_days=int(COOLDOWN_DAYS),
-                    walk_forward=True,
-                    wf_min_train=int(wf_min_train),
                 )
+
+                mets = compute_performance(df_bt, trades, float(INIT_CAP_PER_TICKER))
                 s = mets.get("Sharpe-Ratio", np.nan)
-                t = mets.get("Number of Trades", 0)
                 if np.isfinite(s):
                     sharps.append(float(s))
                     valid_parts += 1
-                trades_sum += int(t) if pd.notna(t) else 0
-    
-            if valid_parts == 0 or len(sharps) == 0:
-                raise ValueError("Keine gültigen OOS-Hälften (Sharpe/Trades leer).")
-    
-            return float(np.nanmedian(sharps)), int(trades_sum), int(valid_parts)
-    
-        def _sample_params(rng):
-            return dict(
-                lookback = rng.randrange(lb_lo, lb_hi + 1, 5),
-                horizon  = rng.randrange(hz_lo, hz_hi + 1, 1),
-                thresh   = rng.uniform(thr_lo, thr_hi),
-                entry    = rng.uniform(en_lo, en_hi),
-                exit     = rng.uniform(ex_lo, ex_hi),
-            )
-    
+                trades_sum += int(mets.get("Number of Trades", 0))
+
+            if valid_parts == 0 or not sharps:
+                raise ValueError("Keine gültigen Sharpe-Werte")
+
+            return float(np.median(sharps)), int(trades_sum), int(valid_parts)
+
         rows = []
         best = None
         prog = st.progress(0.0)
         err_counter = Counter()
         valid_trials = 0
-    
+
         for t in range(int(n_trials)):
             p = _sample_params(rng)
             if p["exit"] >= p["entry"]:
                 prog.progress((t + 1) / int(n_trials))
                 continue
-    
+
             sharps_all = []
             trades_total = 0
             valid_parts_total = 0
             ok_tickers = 0
-    
+
             for tk in feasible_tickers:
-                df0 = price_map_opt.get(tk)
+                df0 = prefiltered.get(tk)
                 if df0 is None or len(df0) < max(80, int(p["lookback"]) + int(p["horizon"]) + 40):
                     continue
                 try:
@@ -1010,28 +1038,25 @@ with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=Fa
                     ok_tickers += 1
                 except Exception as e:
                     err_counter[str(e)[:90]] += 1
-    
-            # Mindestens 2 Ticker erfolgreich, sonst ist’s statistisch Müll
+
             if ok_tickers < 2 or len(sharps_all) == 0:
                 prog.progress((t + 1) / int(n_trials))
                 continue
-    
+
             sharpe_med = float(np.nanmedian(sharps_all))
             if not np.isfinite(sharpe_med):
                 prog.progress((t + 1) / int(n_trials))
                 continue
-    
-            # Trades-Filter: wir nehmen echte completed Trades Summe,
-            # aber skalieren sinnvoll (pro gültigem Ticker & pro Teilfenster)
+
             denom = max(1, ok_tickers * max(1, valid_parts_total))
             trades_scaled = trades_total / denom
-    
+
             if trades_total < int(min_trades_req):
                 prog.progress((t + 1) / int(n_trials))
                 continue
-    
+
             score = sharpe_med - float(lambda_trades) * float(trades_scaled)
-    
+
             rec = dict(
                 trial=t,
                 score=float(score),
@@ -1045,9 +1070,9 @@ with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=Fa
             valid_trials += 1
             if (best is None) or (rec["score"] > best["score"]):
                 best = rec
-    
+
             prog.progress((t + 1) / int(n_trials))
-    
+
         if not rows:
             st.error("Keine gültigen Kandidaten gefunden – Debug unten.")
             if err_counter:
@@ -1062,20 +1087,24 @@ with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=Fa
             )
         else:
             df_res = pd.DataFrame(rows).sort_values("score", ascending=False)
-            st.success(f"Valid Trials: {valid_trials}/{int(n_trials)} | Beste Score={best['score']:.3f} | Sharpe(med)={best['sharpe_med']:.2f} | Trades={best['trades']}")
+            st.success(
+                f"Valid Trials: {valid_trials}/{int(n_trials)} | "
+                f"Beste Score={best['score']:.3f} | Sharpe(med)={best['sharpe_med']:.2f} | Trades={best['trades']}"
+            )
             c1_, c2_, c3_, c4_, c5_ = st.columns(5)
             c1_.metric("Lookback", int(best["lookback"]))
             c2_.metric("Horizon",  int(best["horizon"]))
             c3_.metric("Target Thresh", f"{best['thresh']:.3f}")
             c4_.metric("Entry Prob",    f"{best['entry']:.2f}")
             c5_.metric("Exit Prob",     f"{best['exit']:.2f}")
-    
+
             st.caption("Top-Ergebnisse (Score = Sharpe_med − λ·Trades_scaled)")
             st.dataframe(df_res.head(25), use_container_width=True)
-            st.download_button("Optimierergebnisse als CSV",
-                               to_csv_eu(df_res),
-                               file_name="param_search_results.csv", mime="text/csv")
-
+            st.download_button(
+                "Optimierergebnisse als CSV",
+                to_csv_eu(df_res),
+                file_name="param_search_results.csv", mime="text/csv"
+            )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1413,37 +1442,32 @@ if results:
         st.dataframe(rt_df.sort_values("Exit Date", ascending=False), use_container_width=True)
         st.download_button("Round-Trips als CSV", to_csv_eu(rt_df), file_name="round_trips.csv", mime="text/csv")
 
-
-
     # ─────────────────────────────────────────────────────────────
-    # 📊 Verteilung der Round-Trip-Ergebnisse (wie Screenshot)
+    # 📊 Verteilung der Round-Trip-Ergebnisse
     # ─────────────────────────────────────────────────────────────
     if not rt_df.empty:
         st.markdown("## 📊 Verteilung der Round-Trip-Ergebnisse")
-    
+
         bins = st.slider("Anzahl Bins", 10, 120, 30, step=5, key="rt_bins_slider")
-    
-        # saubere Numerik
+
         rt_ret = pd.to_numeric(rt_df.get("Return (%)"), errors="coerce").dropna()
         rt_pnl = pd.to_numeric(rt_df.get("PnL Net (€)"), errors="coerce").dropna()
-    
-        # KPIs
+
         n_trades = int(len(rt_ret)) if len(rt_ret) else int(len(rt_df))
         winrate = float((rt_ret > 0).mean()) if len(rt_ret) else float("nan")
         avg_ret = float(rt_ret.mean()) if len(rt_ret) else float("nan")
         med_ret = float(rt_ret.median()) if len(rt_ret) else float("nan")
         std_ret = float(rt_ret.std(ddof=0)) if len(rt_ret) else float("nan")
-    
+
         k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Anzahl", f"{n_trades}")
         k2.metric("Winrate", f"{winrate*100:.2f}%" if np.isfinite(winrate) else "–")
         k3.metric("Ø Return", f"{avg_ret:.2f}%" if np.isfinite(avg_ret) else "–")
         k4.metric("Median", f"{med_ret:.2f}%" if np.isfinite(med_ret) else "–")
         k5.metric("Std-Abw.", f"{std_ret:.2f}%" if np.isfinite(std_ret) else "–")
-    
+
         colL, colR = st.columns(2)
-    
-        # Histogramm Return (%)
+
         with colL:
             st.markdown("### Histogramm: Return (%)")
             if rt_ret.empty:
@@ -1451,7 +1475,6 @@ if results:
             else:
                 fig_ret = go.Figure()
                 fig_ret.add_trace(go.Histogram(x=rt_ret, nbinsx=int(bins), marker_line_width=0))
-                # Linien: Mean & Median
                 if np.isfinite(avg_ret):
                     fig_ret.add_vline(x=avg_ret, line_dash="dash", opacity=0.8)
                 if np.isfinite(med_ret):
@@ -1464,8 +1487,7 @@ if results:
                     margin=dict(t=40, b=40, l=40, r=20),
                 )
                 st.plotly_chart(fig_ret, use_container_width=True)
-    
-        # Histogramm PnL Net (€)
+
         with colR:
             st.markdown("### Histogramm: PnL Net (€)")
             if rt_pnl.empty:
@@ -1473,7 +1495,7 @@ if results:
             else:
                 avg_pnl = float(rt_pnl.mean())
                 med_pnl = float(rt_pnl.median())
-    
+
                 fig_pnl = go.Figure()
                 fig_pnl.add_trace(go.Histogram(x=rt_pnl, nbinsx=int(bins), marker_line_width=0))
                 if np.isfinite(avg_pnl):
@@ -1488,8 +1510,7 @@ if results:
                     margin=dict(t=40, b=40, l=40, r=20),
                 )
                 st.plotly_chart(fig_pnl, use_container_width=True)
-    
-        # Optional: Download der RTs (falls du es hier bündeln willst)
+
         st.download_button(
             "Round-Trips (inkl. Return & PnL) als CSV",
             to_csv_eu(rt_df),
@@ -1498,9 +1519,6 @@ if results:
             key="dl_rt_distribution",
         )
 
-
-
-    
     # ─────────────────────────────────────────────────────────────
     # 📈 Portfolio – Equal-Weight Performance (Close-to-Close)
     # ─────────────────────────────────────────────────────────────
@@ -1534,7 +1552,6 @@ if results:
         if rets2.empty:
             st.info("Portfolio-Returns sind leer (zu wenig Overlap).")
         else:
-            # tägliche Renormalisierung (kein Cash-Drag durch NaNs)
             w_row = rets2.notna().astype(float)
             w_row = w_row.div(w_row.sum(axis=1), axis=0)
             port_ret = (rets2.fillna(0.0) * w_row).sum(axis=1).dropna()
@@ -1575,7 +1592,7 @@ if results:
                 )
 
     # ─────────────────────────────────────────────────────────────
-    # ✅ HIER: Portfolio-Korrelation (Close-Returns) – wie Screenshot
+    # 🔗 Portfolio-Korrelation (Close-Returns)
     # ─────────────────────────────────────────────────────────────
     st.markdown("### 🔗 Portfolio-Korrelation (Close-Returns)")
 
@@ -1597,20 +1614,15 @@ if results:
         if use_ffill:
             prices_corr = prices_corr.ffill()
 
-        # Resample
         if freq_label == "täglich":
-            freq = "D"
             prices_corr = prices_corr
         elif freq_label == "wöchentlich":
-            freq = "W"
             prices_corr = prices_corr.resample("W").last()
         else:
-            freq = "M"
             prices_corr = prices_corr.resample("M").last()
 
         rets_corr = prices_corr.pct_change().dropna(how="all")
 
-        # Filter: ausreichende Datenpunkte je Ticker
         counts = rets_corr.notna().sum()
         keep = counts[counts >= int(min_obs)].index.tolist()
         rets_corr = rets_corr[keep]
@@ -1628,7 +1640,6 @@ if results:
             pair_med = float(np.median(off)) if off.size else float("nan")
             pair_std = float(np.std(off)) if off.size else float("nan")
 
-            # Portfolio-Korrelation (normiert, Equal-Weight)
             cov = rets_corr.cov()
             vols = np.sqrt(np.diag(cov.values))
             n = len(vols)
@@ -1669,7 +1680,7 @@ if results:
             )
 
     # ─────────────────────────────────────────────────────────────
-    # 🔮 Portfolio Forecast (nächste FORECAST_DAYS Tage)
+    # 🔮 Portfolio Forecast
     # ─────────────────────────────────────────────────────────────
     st.markdown(f"### 🔮 Portfolio-Renditeprognose (nächste {int(FORECAST_DAYS)} Tage) – Backtest-basiert")
 
