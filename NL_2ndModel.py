@@ -939,7 +939,7 @@ with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=Fa
 # ─────────────────────────────────────────────────────────────
 # Haupt – Pipeline
 # ─────────────────────────────────────────────────────────────
-st.markdown("<h1 style='font-size: 36px;'>📈 NEW LEVEL 2ND AI-MODELL - AI Modell</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='font-size: 36px;'>📈 NEW LEVEL 2ND AI-MODELL</h1>", unsafe_allow_html=True)
 
 results = []
 all_trades: Dict[str, List[dict]] = {}
