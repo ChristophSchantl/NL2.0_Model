@@ -1,15 +1,16 @@
 # streamlit_app.py
 # ─────────────────────────────────────────────────────────────
-# NEW LEVEL 2ND MODELL – Signal-basierte Strategie (Full Version)
-# pro Ticker separates Konto + robuste Loader + saubere Fixes
-# + Portfolio Forecast (Backtest-basiert) inkl. MC-Band
-# + Portfolio-Korrelation (Close-Returns) inkl. UI + Heatmap + Kennzahlen
-# + Optimizer (Random Search, Walk-Forward-Light) — FIX: Feature-Cache + Prefilter + schneller Eval
+# NEXT LEVEL 2ND MODELL – Signal-basierte Strategie (Full Version, FIXED)
+# Fokus: OOS-Validität, sauberes Timing, robuste Targets, bessere Features
+# - Training/Backtest NUR mit finalen Daily Bars (kein Intraday-Patch im Modell)
+# - Intraday NUR für Anzeige
+# - Walk-Forward standardmäßig ON + Embargo (Label-Overlap vermeiden)
+# - Target wahlweise: Fix-Threshold, Vol-adjust (k·σ), Quantil
+# - Features erweitert (Returns, Vol, Gap, ATR, MA-Spread, RSI-light)
+# - Optional: Proba-Kalibrierung
+# - Forecast: Bootstrap (statt Normal-MC)
 # ─────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────
-# Imports & Global Config
-# ─────────────────────────────────────────────────────────────
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*figure layout has changed to tight.*")
@@ -18,6 +19,7 @@ import streamlit as st
 import yfinance as yf
 import numpy as np
 import pandas as pd
+
 from math import sqrt
 from datetime import datetime, timedelta
 from typing import Tuple, List, Dict, Optional
@@ -27,18 +29,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import brier_score_loss
 
 import plotly.graph_objects as go
 import plotly.express as px
 
-st.set_page_config(page_title="NEXT LEVEL 2ND AI-MODELL", layout="wide")
+# ─────────────────────────────────────────────────────────────
+# Global Config
+# ─────────────────────────────────────────────────────────────
+st.set_page_config(page_title="NEXT LEVEL 2ND AI-MODELL (FIXED)", layout="wide")
 LOCAL_TZ = ZoneInfo("Europe/Zurich")
-MAX_WORKERS = 6  # yfinance rate-limit sensibel: ggf. 2-4
+MAX_WORKERS = 6  # yfinance rate-limit sensibel
 pd.options.display.float_format = "{:,.4f}".format
 
 
 # ─────────────────────────────────────────────────────────────
-# Helpers (CSV zuerst wegen früher Nutzung)
+# Helpers (CSV)
 # ─────────────────────────────────────────────────────────────
 def to_csv_eu(df: pd.DataFrame, float_format: Optional[str] = None) -> bytes:
     return df.to_csv(
@@ -74,13 +81,13 @@ def parse_ticker_csv(path_or_buffer) -> List[str]:
 
 
 # ─────────────────────────────────────────────────────────────
-# Sidebar – Global Controls
+# UI – Sidebar Controls
 # ─────────────────────────────────────────────────────────────
 st.sidebar.header("Parameter")
 
 ticker_source = st.sidebar.selectbox("Ticker-Quelle", ["Manuell (Textfeld)", "CSV-Upload"], index=0)
-
 tickers_final: List[str] = []
+
 if ticker_source == "Manuell (Textfeld)":
     tickers_input = st.sidebar.text_input("Tickers (Komma-getrennt)", value="REGN, LULU, VOW3.DE, REI, DDL")
     tickers_final = _normalize_tickers([t for t in tickers_input.split(",") if t.strip()])
@@ -121,13 +128,32 @@ st.sidebar.download_button(
 
 TICKERS = tickers_final
 
-# Core Backtest-Parameter
+# Core Parameter
 START_DATE = st.sidebar.date_input("Start Date", value=pd.to_datetime("2025-01-01"))
 END_DATE   = st.sidebar.date_input("End Date", value=pd.to_datetime(datetime.now(LOCAL_TZ).date()))
 
-LOOKBACK = st.sidebar.number_input("Lookback (Tage)", 10, 252, 35, step=5)
+LOOKBACK = st.sidebar.number_input("Lookback (Tage)", 10, 252, 60, step=5)
 HORIZON  = st.sidebar.number_input("Horizon (Tage)", 1, 10, 5)
-THRESH   = st.sidebar.number_input("Threshold für Target (fix)", 0.0, 0.1, 0.046, step=0.005, format="%.3f")
+
+# ───── Target Definition (NEU, robust)
+st.sidebar.markdown("**Target Definition (robust)**")
+target_mode = st.sidebar.selectbox(
+    "Target-Modus",
+    ["Fix (FutureRet > THRESH)", "Vol-adjust (FutureRet > k·σ)", "Quantil (FutureRet > q)"],
+    index=1
+)
+THRESH = st.sidebar.number_input(
+    "THRESH (nur Fix)", 0.0, 0.20, 0.046, step=0.005, format="%.3f",
+    help="Nur relevant im Fix-Modus."
+)
+k_vol = st.sidebar.number_input(
+    "k (nur Vol-adjust)", 0.0, 10.0, 1.0, step=0.1, format="%.1f",
+    help="Target=1 wenn FutureRet > k * rolling_sigma (auf Open→Open Returns)."
+)
+q_quant = st.sidebar.slider(
+    "q (nur Quantil)", 0.50, 0.95, 0.70, step=0.01,
+    help="Target=1 wenn FutureRet oberhalb Trainings-Quantil q liegt (im jeweiligen Train-Fenster)."
+)
 
 ENTRY_PROB = st.sidebar.slider("Entry Threshold (P(Signal))", 0.0, 1.0, 0.62, step=0.01)
 EXIT_PROB  = st.sidebar.slider("Exit Threshold (P(Signal))",  0.0, 1.0, 0.48, step=0.01)
@@ -135,34 +161,25 @@ if EXIT_PROB >= ENTRY_PROB:
     st.sidebar.error("Exit-Threshold muss unter Entry-Threshold liegen.")
     st.stop()
 
-MIN_HOLD_DAYS = st.sidebar.number_input(
-    "Mindesthaltedauer (Handelstage)", 0, 252, 5, step=1,
-    help="Sperrt Exits, bis die Position mindestens so viele Handelstage gehalten wurde."
-)
-COOLDOWN_DAYS = st.sidebar.number_input(
-    "Cooling Phase nach Exit (Handelstage)", 0, 252, 0, step=1,
-    help="Verhindert Neueinstiege für X Handelstage nach einem Exit (pro Ticker)."
-)
+MIN_HOLD_DAYS = st.sidebar.number_input("Mindesthaltedauer (Handelstage)", 0, 252, 5, step=1)
+COOLDOWN_DAYS = st.sidebar.number_input("Cooling Phase nach Exit (Handelstage)", 0, 252, 0, step=1)
 
 COMMISSION   = st.sidebar.number_input("Commission (ad valorem, z.B. 0.001=10bp)", 0.0, 0.02, 0.004, step=0.0001, format="%.4f")
 SLIPPAGE_BPS = st.sidebar.number_input("Slippage (bp je Ausführung)", 0, 50, 5, step=1)
 POS_FRAC     = st.sidebar.slider("Positionsgröße (% des Kapitals)", 0.1, 1.0, 1.0, step=0.1)
 
-# Pro Ticker separates Konto:
 INIT_CAP_PER_TICKER = st.sidebar.number_input("Initial Capital pro Ticker (€)", min_value=1000.0, value=10_000.0, step=1000.0, format="%.2f")
 
-# Intraday
-use_live = st.sidebar.checkbox("Letzten Tag intraday aggregieren (falls verfügbar)", value=True)
-intraday_interval = st.sidebar.selectbox("Intraday-Intervall (Tail & 5-Tage-Chart)", ["1m", "2m", "5m", "15m"], index=2)
-fallback_last_session = st.sidebar.checkbox("Fallback: letzte Session verwenden (wenn heute leer)", value=False)
-exec_mode = st.sidebar.selectbox("Execution Mode", ["Next Open (backtest+live)", "Market-On-Close (live only)"])
-moc_cutoff_min = st.sidebar.number_input("MOC Cutoff (Minuten vor Close, nur live)", 5, 60, 15, step=5)
+# Intraday – Anzeige only
+st.sidebar.markdown("**Intraday (Anzeige only)**")
+show_intraday = st.sidebar.checkbox("Intraday-Charts anzeigen (kein Einfluss auf Modell)", value=True)
+intraday_interval = st.sidebar.selectbox("Intraday-Intervall (5-Tage-Chart)", ["1m", "2m", "5m", "15m"], index=2)
 intraday_chart_type = st.sidebar.selectbox("Intraday-Chart", ["Candlestick (OHLC)", "Close-Linie"], index=0)
 
 # Modellparameter
 st.sidebar.markdown("**Modellparameter**")
-n_estimators  = st.sidebar.number_input("n_estimators",  10, 500, 100, step=10)
-learning_rate = st.sidebar.number_input("learning_rate", 0.01, 1.0, 0.1, step=0.01, format="%.2f")
+n_estimators  = st.sidebar.number_input("n_estimators",  10, 500, 150, step=10)
+learning_rate = st.sidebar.number_input("learning_rate", 0.01, 1.0, 0.05, step=0.01, format="%.2f")
 max_depth     = st.sidebar.number_input("max_depth",     1, 10, 3, step=1)
 MODEL_PARAMS = dict(
     n_estimators=int(n_estimators),
@@ -171,22 +188,25 @@ MODEL_PARAMS = dict(
     random_state=42
 )
 
-# Walk-forward/OOS
+# OOS / Walk-forward (standardmäßig ON)
 st.sidebar.markdown("**OOS / Walk-Forward**")
-use_walk_forward = st.sidebar.checkbox("Walk-Forward (OOS) Probas verwenden", value=False, help="Langsamer, aber OOS-robuster.")
-wf_min_train = st.sidebar.number_input("WF min_train Bars", 40, 500, 120, step=10)
+use_walk_forward = st.sidebar.checkbox("Walk-Forward Probas verwenden (empfohlen)", value=True)
+wf_min_train = st.sidebar.number_input("WF min_train Bars", 40, 800, 200, step=10)
+embargo_bars = st.sidebar.number_input(
+    "Embargo Bars (Label-Overlap vermeiden)", 0, 30, int(HORIZON), step=1,
+    help="Train endet bei t-(embargo). Typisch = Horizon."
+)
 
-# Optionsdaten
-st.sidebar.markdown("**Optionsdaten (Einzelaktie)**")
-use_chain_live = st.sidebar.checkbox("Live-Optionskette je Aktie nutzen (PCR/VOI)", value=True)
-atm_band_pct   = st.sidebar.slider("ATM-Band (±%)", 1, 15, 5, step=1) / 100.0
-max_days_to_exp= st.sidebar.slider("Max. Restlaufzeit (Tage)", 7, 45, 21, step=1)
-n_expiries     = st.sidebar.slider("Nächste n Verfälle", 1, 4, 2, step=1)
+# Kalibrierung
+st.sidebar.markdown("**Probability Calibration**")
+use_calibration = st.sidebar.checkbox("Probas kalibrieren (sigmoid)", value=False)
+calib_cv = st.sidebar.number_input("Kalibrierung CV-Folds", 2, 10, 3, step=1)
 
-# Forecast (Backtest-basiert)
-st.sidebar.markdown("**Portfolio Forecast (Backtest-basiert)**")
+# Forecast
+st.sidebar.markdown("**Portfolio Forecast**")
 FORECAST_DAYS = st.sidebar.number_input("Forecast Horizon (Tage)", 1, 30, 7, step=1)
-MC_SIMS = st.sidebar.number_input("MC Simulationen", 200, 5000, 1500, step=100)
+BOOT_SIMS = st.sidebar.number_input("Bootstrap Simulationen", 200, 20000, 5000, step=200)
+block_len = st.sidebar.number_input("Block-Länge (Tage, Bootstrap)", 1, 30, 5, step=1)
 
 # Housekeeping
 c1, c2 = st.sidebar.columns(2)
@@ -200,25 +220,14 @@ if c2.button("↻ Rerun"):
 # ─────────────────────────────────────────────────────────────
 # Misc Helpers
 # ─────────────────────────────────────────────────────────────
-def show_styled_or_plain(df: pd.DataFrame, styler):
-    try:
-        st.markdown(styler.to_html(), unsafe_allow_html=True)
-    except Exception as e:
-        st.warning(f"Styled-Tabelle nicht renderbar, fallback auf DataFrame. ({e})")
-        st.dataframe(df, use_container_width=True)
-
-
 def slope(arr: np.ndarray) -> float:
     x = np.arange(len(arr))
     return np.polyfit(x, arr, 1)[0] if len(arr) >= 2 else 0.0
 
 
-def last_timestamp_info(df: pd.DataFrame, meta: Optional[dict] = None):
+def last_timestamp_info(df: pd.DataFrame):
     ts = df.index[-1]
-    msg = f"Letzter Datenpunkt: {ts.strftime('%Y-%m-%d %H:%M %Z')}"
-    if meta and meta.get("tail_is_intraday") and meta.get("tail_ts") is not None:
-        msg += f" (intraday bis {meta['tail_ts'].strftime('%H:%M %Z')})"
-    st.caption(msg)
+    st.caption(f"Letzter Daily-Datenpunkt: {ts.strftime('%Y-%m-%d %H:%M %Z')}")
 
 
 @st.cache_data(show_spinner=False, ttl=24*60*60)
@@ -238,44 +247,18 @@ def get_ticker_name(ticker: str) -> str:
     return ticker
 
 
-def style_live_board(df: pd.DataFrame, prob_col: str, entry_threshold: float):
-    def _row_color(row):
-        act = str(row.get("Action_adj", row.get("Action",""))).lower()
-        if "enter" in act: return ["background-color: #D7F3F7"] * len(row)
-        if "exit"  in act: return ["background-color: #FFE8E8"] * len(row)
-        try:
-            if float(row.get(prob_col, np.nan)) >= float(entry_threshold):
-                return ["background-color: #E6F7FF"] * len(row)
-        except Exception:
-            pass
-        return ["background-color: #F7F7F7"] * len(row)
-
-    fmt = {prob_col: "{:.4f}"}
-    if "Close" in df.columns: fmt["Close"] = "{:.2f}"
-    if "Target_5d" in df.columns: fmt["Target_5d"] = "{:.2f}"
-    for c in ["PCR_oi","PCR_vol","VOI_call","VOI_put","IV_skew_p_minus_c","VOL_tot","OI_tot"]:
-        if c in df.columns: fmt[c] = "{:.4f}"
-
-    sty = df.style.format(fmt).apply(_row_color, axis=1)
-    subset_cols = [c for c in ["Action","Action_adj"] if c in df.columns]
-    if subset_cols:
-        sty = sty.set_properties(subset=subset_cols, **{"font-weight": "600"})
-    return sty
+def show_styled_or_plain(df: pd.DataFrame, styler):
+    try:
+        st.markdown(styler.to_html(), unsafe_allow_html=True)
+    except Exception:
+        st.dataframe(df, use_container_width=True)
 
 
 # ─────────────────────────────────────────────────────────────
-# Data Loading
+# Data Loading (Daily only for model/backtest)
 # ─────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False, ttl=180)
-def get_price_data_tail_intraday(
-    ticker: str,
-    years: int = 3,
-    use_tail: bool = True,
-    interval: str = "5m",
-    fallback_last_session: bool = False,
-    exec_mode_key: str = "Next Open (backtest+live)",
-    moc_cutoff_min_val: int = 15,
-) -> Tuple[pd.DataFrame, dict]:
+@st.cache_data(show_spinner=False, ttl=6*60*60)
+def get_price_data_daily(ticker: str, years: int = 5) -> pd.DataFrame:
     tk = yf.Ticker(ticker)
     df = tk.history(period=f"{years}y", interval="1d", auto_adjust=True, actions=False)
     if df.empty:
@@ -284,72 +267,11 @@ def get_price_data_tail_intraday(
         df.index = df.index.tz_localize("UTC")
     df.index = df.index.tz_convert(LOCAL_TZ)
     df = df.sort_index().drop_duplicates()
-    meta = {"tail_is_intraday": False, "tail_ts": None}
-
-    if not use_tail:
-        df.dropna(subset=["High", "Low", "Close", "Open"], inplace=True)
-        return df, meta
-
-    # intraday tail (nur "heute" aggregieren)
-    try:
-        intraday = tk.history(period="1d", interval=interval, auto_adjust=True, actions=False, prepost=False)
-        if not intraday.empty:
-            if intraday.index.tz is None:
-                intraday.index = intraday.index.tz_localize("UTC")
-            intraday.index = intraday.index.tz_convert(LOCAL_TZ)
-            intraday = intraday.sort_index()
-        else:
-            intraday = pd.DataFrame()
-    except Exception:
-        intraday = pd.DataFrame()
-
-    # Market-On-Close live: bis cutoff schneiden
-    if exec_mode_key.startswith("Market-On-Close") and not intraday.empty:
-        now_local = datetime.now(LOCAL_TZ)
-        cutoff_time = now_local - timedelta(minutes=int(moc_cutoff_min_val))
-        intraday = intraday.loc[:cutoff_time]
-
-    # fallback auf letzte Session
-    if intraday.empty and fallback_last_session:
-        try:
-            intraday5 = tk.history(period="5d", interval=interval, auto_adjust=True, actions=False, prepost=False)
-            if not intraday5.empty:
-                if intraday5.index.tz is None:
-                    intraday5.index = intraday5.index.tz_localize("UTC")
-                intraday5.index = intraday5.index.tz_convert(LOCAL_TZ)
-                intraday5 = intraday5.sort_index()
-                last_session_date = intraday5.index[-1].date()
-                intraday = intraday5.loc[str(last_session_date)]
-        except Exception:
-            pass
-
-    if not intraday.empty:
-        last_bar = intraday.iloc[-1]
-        day_key = pd.Timestamp(last_bar.name.date(), tz=LOCAL_TZ)
-
-        daily_row = {
-            "Open":   float(intraday["Open"].iloc[0]),
-            "High":   float(intraday["High"].max()),
-            "Low":    float(intraday["Low"].min()),
-            "Close":  float(last_bar["Close"]),
-            "Volume": float(intraday["Volume"].sum()) if "Volume" in intraday.columns else np.nan,
-        }
-
-        if day_key in df.index:
-            for k, v in daily_row.items():
-                df.loc[day_key, k] = v
-        else:
-            df.loc[day_key] = daily_row
-
-        df = df.sort_index()
-        meta["tail_is_intraday"] = True
-        meta["tail_ts"] = last_bar.name
-
-    df.dropna(subset=["High", "Low", "Close", "Open"], inplace=True)
-    return df, meta
+    df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
+    return df
 
 
-@st.cache_data(show_spinner=False, ttl=180)
+@st.cache_data(show_spinner=False, ttl=15*60)
 def get_intraday_last_n_sessions(ticker: str, sessions: int = 5, days_buffer: int = 10, interval: str = "5m") -> pd.DataFrame:
     tk = yf.Ticker(ticker)
     intr = tk.history(period=f"{days_buffer}d", interval=interval, auto_adjust=True, actions=False, prepost=False)
@@ -365,172 +287,127 @@ def get_intraday_last_n_sessions(ticker: str, sessions: int = 5, days_buffer: in
     return intr.loc[mask].copy()
 
 
-def load_all_prices(
-    tickers: List[str], start: str, end: str,
-    use_tail: bool, interval: str, fallback_last: bool,
-    exec_key: str, moc_cutoff: int
-) -> Tuple[Dict[str, pd.DataFrame], Dict[str, dict]]:
+def load_all_prices_daily(tickers: List[str], start: str, end: str) -> Dict[str, pd.DataFrame]:
     price_map: Dict[str, pd.DataFrame] = {}
-    meta_map: Dict[str, dict] = {}
     if not tickers:
-        return price_map, meta_map
+        return price_map
 
-    st.info(f"Kurse laden für {len(tickers)} Ticker … (parallel)")
+    st.info(f"Daily-Kurse laden für {len(tickers)} Ticker … (parallel)")
     prog = st.progress(0.0)
 
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(tickers))) as ex:
-        future_map = {
-            ex.submit(
-                get_price_data_tail_intraday, tk, 3, use_tail, interval, fallback_last, exec_key, int(moc_cutoff)
-            ): tk
-            for tk in tickers
-        }
-
+        future_map = {ex.submit(get_price_data_daily, tk, 5): tk for tk in tickers}
         done = 0
         for fut in as_completed(future_map):
             tk = future_map[fut]
             try:
-                df_full, meta = fut.result()
+                df_full = fut.result()
                 df_use = df_full.loc[str(start):str(end)].copy()
                 if not df_use.empty:
                     price_map[tk] = df_use
-                    meta_map[tk] = meta
             except Exception as e:
                 st.error(f"Fehler beim Laden von {tk}: {e}")
             finally:
                 done += 1
                 prog.progress(done / len(tickers))
 
-    return price_map, meta_map
+    return price_map
 
 
 # ─────────────────────────────────────────────────────────────
-# Optionsketten-Aggregation (PCR/VOI)
+# Features & Target (sauberes Timing)
 # ─────────────────────────────────────────────────────────────
-def _atm_strike(ref_px: float, strikes: np.ndarray) -> float:
-    if not np.isfinite(ref_px) or strikes.size == 0:
-        return np.nan
-    return float(strikes[np.argmin(np.abs(strikes - ref_px))])
+def _true_range(df: pd.DataFrame) -> pd.Series:
+    prev_close = df["Close"].shift(1)
+    tr = pd.concat([
+        (df["High"] - df["Low"]).abs(),
+        (df["High"] - prev_close).abs(),
+        (df["Low"]  - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr
 
 
-def _band_mask(strikes: pd.Series, atm: float, band: float) -> pd.Series:
-    if not np.isfinite(atm):
-        return pd.Series([False]*len(strikes), index=strikes.index)
-    lo, hi = atm*(1-band), atm*(1+band)
-    return strikes.between(lo, hi)
+def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    d = close.diff()
+    up = d.clip(lower=0.0)
+    dn = (-d).clip(lower=0.0)
+    rs = up.rolling(period).mean() / (dn.rolling(period).mean() + 1e-12)
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
-@st.cache_data(show_spinner=False, ttl=180)
-def get_equity_chain_aggregates_for_today(
-    ticker: str,
-    ref_price: float,
-    atm_band: float,
-    n_exps: int,
-    max_days: int
-) -> pd.DataFrame:
-    tk = yf.Ticker(ticker)
-    try:
-        exps = tk.options or []
-    except Exception:
-        exps = []
-    if not exps:
-        return pd.DataFrame()
-
-    today = pd.Timestamp.today(tz=LOCAL_TZ).normalize()
-    exps_filt = []
-    for e in exps:
-        try:
-            d = pd.Timestamp(e).tz_localize("UTC").tz_convert(LOCAL_TZ).normalize()
-            if (d - today).days <= max_days:
-                exps_filt.append((d, e))
-        except Exception:
-            pass
-    exps_filt.sort(key=lambda x: x[0])
-    exps_use = [e for _, e in exps_filt[:max(1, n_exps)]]
-    if not exps_use:
-        return pd.DataFrame()
-
-    rows = []
-    for e in exps_use:
-        try:
-            ch = tk.option_chain(e)
-            calls, puts = ch.calls.copy(), ch.puts.copy()
-        except Exception:
-            continue
-
-        for df in (calls, puts):
-            for c in ["volume","openInterest","impliedVolatility","strike"]:
-                if c not in df.columns:
-                    df[c] = np.nan
-
-        strikes = np.sort(pd.concat([calls["strike"], puts["strike"]]).dropna().unique())
-        atm = _atm_strike(ref_price, strikes)
-
-        mC = calls[_band_mask(calls["strike"], atm, atm_band)]
-        mP = puts [_band_mask(puts ["strike"], atm, atm_band)]
-
-        vC = float(np.nansum(mC["volume"])); vP = float(np.nansum(mP["volume"]))
-        oiC= float(np.nansum(mC["openInterest"])); oiP= float(np.nansum(mP["openInterest"]))
-        ivC= float(np.nanmean(mC["impliedVolatility"])) if len(mC) else np.nan
-        ivP= float(np.nanmean(mP["impliedVolatility"])) if len(mP) else np.nan
-
-        rows.append({"exp": e, "vol_c": vC, "vol_p": vP, "oi_c": oiC, "oi_p": oiP,
-                     "voi_c": vC/max(oiC,1.0), "voi_p": vP/max(oiP,1.0),
-                     "iv_c": ivC, "iv_p": ivP})
-
-    if not rows:
-        return pd.DataFrame()
-
-    agg = pd.DataFrame(rows).agg({"vol_c":"sum","vol_p":"sum","oi_c":"sum","oi_p":"sum",
-                                  "voi_c":"mean","voi_p":"mean","iv_c":"mean","iv_p":"mean"})
-    out = pd.DataFrame([{
-        "PCR_vol": float(agg["vol_p"]/max(agg["vol_c"],1.0)),
-        "PCR_oi":  float(agg["oi_p"] /max(agg["oi_c"],1.0)),
-        "VOI_call": float(agg["voi_c"]),
-        "VOI_put":  float(agg["voi_p"]),
-        "IV_skew_p_minus_c": float(agg["iv_p"] - agg["iv_c"]),
-        "VOL_tot":  float(agg["vol_c"] + agg["vol_p"]),
-        "OI_tot":   float(agg["oi_c"]  + agg["oi_p"]),
-    }])
-    out.index = [pd.Timestamp.today(tz=LOCAL_TZ).normalize()]
-    return out
-
-
-# ─────────────────────────────────────────────────────────────
-# Features
-# ─────────────────────────────────────────────────────────────
-def make_features(df: pd.DataFrame, lookback: int, horizon: int, exog: Optional[pd.DataFrame]=None) -> pd.DataFrame:
-    if len(df) < (lookback + horizon + 5):
-        raise ValueError("Zu wenige Bars für Lookback/Horizon (bitte Zeitraum erweitern oder Parameter senken).")
+def make_features(df: pd.DataFrame, lookback: int, horizon: int) -> pd.DataFrame:
+    if len(df) < (lookback + horizon + 30):
+        raise ValueError("Zu wenige Bars. Zeitraum verlängern oder Parameter senken.")
 
     feat = df.copy()
 
+    # Baseline (dein Original)
     feat["Range"]     = feat["High"].rolling(lookback).max() - feat["Low"].rolling(lookback).min()
     feat["SlopeHigh"] = feat["High"].rolling(lookback).apply(slope, raw=True)
     feat["SlopeLow"]  = feat["Low"].rolling(lookback).apply(slope, raw=True)
 
-    feat = feat.iloc[lookback-1:].copy()
+    # Simple, robuste Add-ons
+    feat["Ret_1d"]  = feat["Close"].pct_change(1)
+    feat["Ret_5d"]  = feat["Close"].pct_change(5)
+    feat["Ret_20d"] = feat["Close"].pct_change(20)
 
-    if exog is not None and not exog.empty:
-        feat = feat.join(exog, how="left").ffill()
+    feat["Gap"] = feat["Open"] / feat["Close"].shift(1) - 1.0
 
-    # Target konsistent zu "Next Open"
+    tr = _true_range(feat)
+    feat["ATR_14"] = tr.rolling(14).mean()
+    feat["ATRpct_14"] = feat["ATR_14"] / (feat["Close"] + 1e-12)
+
+    feat["Vol_20"] = feat["Ret_1d"].rolling(20).std(ddof=0)
+    feat["Vol_60"] = feat["Ret_1d"].rolling(60).std(ddof=0)
+
+    ma20 = feat["Close"].rolling(20).mean()
+    ma60 = feat["Close"].rolling(60).mean()
+    feat["MA20_spread"] = feat["Close"] / (ma20 + 1e-12) - 1.0
+    feat["MA60_spread"] = feat["Close"] / (ma60 + 1e-12) - 1.0
+
+    feat["RSI_14"] = _rsi(feat["Close"], 14)
+
+    # Align
+    feat = feat.iloc[max(lookback-1, 60):].copy()
+
+    # Label/Realisation (Next Open Execution – konsistent)
     # FutureRetExec(t) = Open(t+horizon) / Open(t+1) - 1
-    feat["FutureRetExec"] = feat["Open"].shift(-horizon) / feat["Open"].shift(-1) - 1
+    feat["FutureRetExec"] = feat["Open"].shift(-horizon) / feat["Open"].shift(-1) - 1.0
+
     return feat
 
 
-# ─────────────────────────────────────────────────────────────
-# ✅ Optimizer-Speedup: Feature-Cache (pro df/params) für Random Search
-# ─────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False, ttl=3600)
-def build_feature_cache(df: pd.DataFrame, lookback: int, horizon: int, threshold: float):
-    feat = make_features(df, lookback, horizon)
-    hist = feat.iloc[:-1].dropna(subset=["FutureRetExec"]).copy()
-    if hist.empty:
-        return None, None
-    hist["Target"] = (hist["FutureRetExec"] > threshold).astype(int)
-    return feat, hist
+def build_target(train_future_ret: pd.Series, mode: str, thr: float, k: float, q: float, vol_ref: Optional[pd.Series]) -> pd.Series:
+    fr = pd.to_numeric(train_future_ret, errors="coerce")
+
+    if mode.startswith("Fix"):
+        return (fr > float(thr)).astype(int)
+
+    if mode.startswith("Vol-adjust"):
+        if vol_ref is None:
+            raise ValueError("Vol-adjust: vol_ref fehlt.")
+        # vol_ref ist eine rolling sigma (z.B. Open→Open oder Close→Close Proxy)
+        v = pd.to_numeric(vol_ref, errors="coerce")
+        return (fr > float(k) * v).astype(int)
+
+    # Quantil
+    qq = float(np.nanquantile(fr.values, float(q))) if np.isfinite(fr).sum() > 10 else np.nan
+    if not np.isfinite(qq):
+        return pd.Series(np.nan, index=fr.index)
+    return (fr > qq).astype(int)
+
+
+def make_pipe(model_params: dict, calibrate: bool, calib_folds: int):
+    base = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("model", GradientBoostingClassifier(**model_params)),
+    ])
+    if not calibrate:
+        return base
+    # CalibratedClassifierCV braucht estimator, nicht Pipeline – wir kalibrieren das Modell nach Imputer
+    # Pragmatiker-Variante: Pipeline für X->impute und dahinter Calibrator mit Base-Model
+    # -> wir machen’s sauber mit zweistufigem Fit im Code (siehe train/predict unten).
+    return base
 
 
 # ─────────────────────────────────────────────────────────────
@@ -547,6 +424,7 @@ def backtest_next_open(
     min_hold_days: int = 0,
     cooldown_days: int = 0,
 ) -> Tuple[pd.DataFrame, List[dict]]:
+
     df = df.copy()
     n = len(df)
     if n < 2:
@@ -641,7 +519,7 @@ def backtest_next_open(
 
 
 # ─────────────────────────────────────────────────────────────
-# Performance-Kennzahlen
+# Performance
 # ─────────────────────────────────────────────────────────────
 def _cagr_from_path(values: pd.Series) -> float:
     if len(values) < 2:
@@ -657,7 +535,7 @@ def _sortino(rets: pd.Series) -> float:
         return np.nan
     mean = rets.mean() * 252
     downside = rets[rets < 0]
-    dd = downside.std() * np.sqrt(252) if len(downside) else np.nan
+    dd = downside.std(ddof=0) * np.sqrt(252) if len(downside) else np.nan
     return mean / dd if dd and np.isfinite(dd) and dd > 0 else np.nan
 
 
@@ -681,8 +559,8 @@ def _winrate_roundtrips(trades: List[dict]) -> float:
 def compute_performance(df_bt: pd.DataFrame, trades: List[dict], init_cap: float) -> dict:
     net_ret = (df_bt["Equity_Net"].iloc[-1] / init_cap - 1) * 100
     rets = df_bt["Equity_Net"].pct_change().dropna()
-    vol_ann = rets.std() * sqrt(252) * 100
-    sharpe = (rets.mean() * sqrt(252)) / (rets.std() + 1e-12)
+    vol_ann = rets.std(ddof=0) * sqrt(252) * 100
+    sharpe = (rets.mean() * sqrt(252)) / (rets.std(ddof=0) + 1e-12)
     dd = (df_bt["Equity_Net"] - df_bt["Equity_Net"].cummax()) / df_bt["Equity_Net"].cummax()
     max_dd = dd.min() * 100
     calmar = (net_ret/100) / abs(max_dd/100) if max_dd < 0 else np.nan
@@ -714,530 +592,321 @@ def compute_performance(df_bt: pd.DataFrame, trades: List[dict], init_cap: float
     }
 
 
-def compute_round_trips(all_trades: Dict[str, List[dict]]) -> pd.DataFrame:
-    rows = []
-    for tk, tr in all_trades.items():
-        name = get_ticker_name(tk)
-        current_entry = None
-        for ev in tr:
-            if ev["Typ"] == "Entry":
-                current_entry = ev
-            elif ev["Typ"] == "Exit" and current_entry is not None:
-                entry_date = pd.to_datetime(current_entry["Date"])
-                exit_date  = pd.to_datetime(ev["Date"])
-                hold_days  = (exit_date - entry_date).days
-                shares     = float(current_entry.get("Shares", 0.0))
-                entry_p    = float(current_entry.get("Price", np.nan))
-                exit_p     = float(ev.get("Price", np.nan))
-                fee_e      = float(current_entry.get("Fees", 0.0))
-                fee_x      = float(ev.get("Fees", 0.0))
-                pnl_net    = float(ev.get("Net P&L", 0.0))
-                cost_net   = shares * entry_p + fee_e
-                ret_pct    = (pnl_net / cost_net * 100.0) if cost_net else np.nan
-                rows.append({
-                    "Ticker": tk, "Name": name,
-                    "Entry Date": entry_date, "Exit Date": exit_date,
-                    "Hold (days)": hold_days,
-                    "Entry Prob": current_entry.get("Prob", np.nan),
-                    "Exit Prob":  ev.get("Prob", np.nan),
-                    "Shares": round(shares, 4),
-                    "Entry Price": round(entry_p, 4), "Exit Price": round(exit_p, 4),
-                    "PnL Net (€)": round(pnl_net, 2), "Fees (€)": round(fee_e + fee_x, 2),
-                    "Return (%)": round(ret_pct, 2),
-                })
-                current_entry = None
-    return pd.DataFrame(rows)
-
-
 # ─────────────────────────────────────────────────────────────
-# Forecast Helpers (Backtest-basiert)
+# Walk-Forward Training (OOS) + Embargo + optional Calibration
 # ─────────────────────────────────────────────────────────────
-def _safe_mean(x: pd.Series) -> float:
-    x = pd.to_numeric(x, errors="coerce").dropna()
-    return float(x.mean()) if len(x) else float("nan")
+def fit_predict_proba(
+    X_train: np.ndarray, y_train: np.ndarray,
+    X_pred: np.ndarray,
+    model_params: dict,
+    calibrate: bool,
+    calib_folds: int
+) -> np.ndarray:
+    # Pipeline: impute + model
+    base = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("model", GradientBoostingClassifier(**model_params)),
+    ])
+
+    if not calibrate:
+        base.fit(X_train, y_train)
+        return base.predict_proba(X_pred)[:, 1]
+
+    # Calibrate on top of base pipeline
+    # Wichtig: Calibrator darf nur auf Train laufen, NICHT auf Zukunft.
+    calib = CalibratedClassifierCV(base, method="sigmoid", cv=int(calib_folds))
+    calib.fit(X_train, y_train)
+    return calib.predict_proba(X_pred)[:, 1]
 
 
-def estimate_expected_return_from_backtest(feat: pd.DataFrame, forecast_days: int, threshold: float) -> dict:
-    """
-    Schätzt erwartete Rendite über forecast_days aus historischer (Open->Open) Realisation
-    + aktueller SignalProb (Mixture: p*mu1 + (1-p)*mu0).
-    """
-    if feat is None or feat.empty or "Open" not in feat.columns or "SignalProb" not in feat.columns:
-        return {}
-
-    future_ret = feat["Open"].shift(-int(forecast_days)) / feat["Open"].shift(-1) - 1
-    tmp = pd.DataFrame({"FutureRet": future_ret}).dropna()
-    if tmp.empty:
-        return {}
-
-    tmp["TargetF"] = (tmp["FutureRet"] > float(threshold)).astype(int)
-    mu1 = _safe_mean(tmp.loc[tmp["TargetF"] == 1, "FutureRet"])
-    mu0 = _safe_mean(tmp.loc[tmp["TargetF"] == 0, "FutureRet"])
-
-    p = float(pd.to_numeric(feat["SignalProb"].iloc[-1], errors="coerce"))
-    if not np.isfinite(p):
-        p = 0.5
-    exp_ret = p * mu1 + (1.0 - p) * mu0
-
-    return {"mu1": mu1, "mu0": mu0, "p": p, "exp_ret": exp_ret}
-
-
-def _ensure_psd_cov(cov: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    cov = np.asarray(cov, dtype=float)
-    cov = (cov + cov.T) / 2.0
-    try:
-        w, v = np.linalg.eigh(cov)
-        w = np.maximum(w, eps)
-        return (v * w) @ v.T
-    except Exception:
-        d = np.diag(np.maximum(np.diag(cov), eps))
-        return d
-
-
-def portfolio_forecast_mc(exp_rets: pd.Series, cov: pd.DataFrame, nav0: float, sims: int = 1500, seed: int = 42) -> dict:
-    tickers = exp_rets.index.tolist()
-    cov = cov.reindex(index=tickers, columns=tickers).fillna(0.0)
-
-    w = np.ones(len(tickers), dtype=float) / max(len(tickers), 1)
-    cov_np = _ensure_psd_cov(cov.values)
-
-    rng = np.random.default_rng(int(seed))
-    draws = rng.multivariate_normal(mean=exp_rets.values, cov=cov_np, size=int(sims))
-
-    port_rets = draws @ w
-    nav_paths = nav0 * (1.0 + port_rets)
-
-    q = np.quantile(port_rets, [0.05, 0.50, 0.95])
-    q_nav = np.quantile(nav_paths, [0.05, 0.50, 0.95])
-
-    return {
-        "port_ret_q05": float(q[0]),
-        "port_ret_q50": float(q[1]),
-        "port_ret_q95": float(q[2]),
-        "nav_q05": float(q_nav[0]),
-        "nav_q50": float(q_nav[1]),
-        "nav_q95": float(q_nav[2]),
-        "port_rets": port_rets,
-        "nav_paths": nav_paths,
-    }
-
-
-# ─────────────────────────────────────────────────────────────
-# Model Training + Backtest (pro Ticker separates Konto)
-# ─────────────────────────────────────────────────────────────
 def make_features_and_train(
     df: pd.DataFrame,
     lookback: int,
     horizon: int,
-    threshold: float,
+    target_mode: str,
+    thr_fix: float,
+    k_vol: float,
+    q_quant: float,
     model_params: dict,
-    entry_prob: float,
-    exit_prob: float,
-    init_capital: float,
-    pos_frac: float,
-    min_hold_days: int = 0,
-    cooldown_days: int = 0,
-    exog_df: Optional[pd.DataFrame] = None,
-    walk_forward: bool = False,
-    wf_min_train: int = 120,
-) -> Tuple[pd.DataFrame, pd.DataFrame, List[dict], dict]:
+    walk_forward: bool,
+    wf_min_train: int,
+    embargo: int,
+    calibrate: bool,
+    calib_folds: int
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[dict], dict, dict]:
 
-    feat = make_features(df, lookback, horizon, exog=exog_df)
+    feat = make_features(df, lookback, horizon)
 
+    # Historie (ohne letzte Zeile – die hat kein komplettes Label)
     hist = feat.iloc[:-1].dropna(subset=["FutureRetExec"]).copy()
-    if len(hist) < 30:
-        raise ValueError("Zu wenige Datenpunkte nach Preprocessing für das Modell.")
+    if len(hist) < max(60, int(wf_min_train)):
+        raise ValueError("Zu wenige Datenpunkte nach Preprocessing. Zeitraum erweitern.")
 
-    X_cols = ["Range", "SlopeHigh", "SlopeLow"]
-    opt_cols = ["PCR_vol", "PCR_oi", "VOI_call", "VOI_put",
-                "IV_skew_p_minus_c", "VOL_tot", "OI_tot"]
-    X_cols += [c for c in opt_cols if c in feat.columns]
+    # Vol-Referenz für Vol-adjust: rolling sigma auf Open→Open (Proxy)
+    open_ret_1d = feat["Open"].pct_change(1)
+    vol_ref = open_ret_1d.rolling(20).std(ddof=0)  # simple, robust
+    hist["VolRef"] = vol_ref.loc[hist.index]
 
-    hist["Target"] = (hist["FutureRetExec"] > threshold).astype(int)
+    # Feature Columns
+    X_cols = [
+        "Range", "SlopeHigh", "SlopeLow",
+        "Ret_1d", "Ret_5d", "Ret_20d",
+        "Gap", "ATRpct_14",
+        "Vol_20", "Vol_60",
+        "MA20_spread", "MA60_spread",
+        "RSI_14",
+    ]
+    X_cols = [c for c in X_cols if c in feat.columns]
 
-    def make_pipe():
-        return Pipeline(steps=[
-            ("imputer", SimpleImputer(strategy="median")),
-            ("model", GradientBoostingClassifier(**model_params)),
-        ])
+    # Target bauen (im Train-Fenster)
+    # -> Für Quantil hängt die Schwelle vom Train ab; für Fix/Vol-adjust können wir global bauen,
+    #    aber in WF wird es trotzdem pro Train berechnet (robuster).
+    def _build_y(train_df: pd.DataFrame) -> pd.Series:
+        fr = train_df["FutureRetExec"]
+        if target_mode.startswith("Vol-adjust"):
+            return build_target(fr, target_mode, thr_fix, k_vol, q_quant, train_df["VolRef"])
+        return build_target(fr, target_mode, thr_fix, k_vol, q_quant, None)
 
-    if hist["Target"].nunique() < 2:
-        feat["SignalProb"] = 0.5
-    else:
-        if not walk_forward:
-            pipe = make_pipe()
-            pipe.fit(hist[X_cols].values, hist["Target"].values)
-            feat["SignalProb"] = pipe.predict_proba(feat[X_cols].values)[:, 1]
+    # Probas
+    probs = np.full(len(feat), np.nan, dtype=float)
+
+    # In-Sample (nicht empfohlen)
+    if not walk_forward:
+        train_df = hist.copy()
+        y = _build_y(train_df)
+        train_df = train_df.assign(Target=y).dropna(subset=["Target"])
+        if train_df["Target"].nunique() < 2:
+            feat["SignalProb"] = 0.5
         else:
-            probs = np.full(len(feat), np.nan, dtype=float)
-            min_train = max(int(wf_min_train), lookback + horizon + 10)
+            X_train = train_df[X_cols].values
+            y_train = train_df["Target"].values.astype(int)
+            p_all = fit_predict_proba(X_train, y_train, feat[X_cols].values, model_params, calibrate, calib_folds)
+            feat["SignalProb"] = p_all
+    else:
+        min_train = max(int(wf_min_train), 120)
+        embargo_use = max(int(embargo), 0)
 
-            for t in range(min_train, len(feat)):
-                train = feat.iloc[:t].dropna(subset=["FutureRetExec"]).copy()
-                if len(train) < min_train:
-                    continue
-                train["Target"] = (train["FutureRetExec"] > threshold).astype(int)
-                if train["Target"].nunique() < 2:
-                    continue
+        # Walk forward: für jeden t ein Modell mit Daten bis (t - embargo_use)
+        for t in range(min_train, len(feat)):
+            end_train = t - embargo_use
+            if end_train <= 30:
+                continue
 
-                pipe = make_pipe()
-                pipe.fit(train[X_cols].values, train["Target"].values)
-                probs[t] = pipe.predict_proba(feat[X_cols].iloc[[t]].values)[0, 1]
+            train_window = feat.iloc[:end_train].dropna(subset=["FutureRetExec"]).copy()
+            if len(train_window) < min_train:
+                continue
 
-            feat["SignalProb"] = pd.Series(probs, index=feat.index).ffill().fillna(0.5)
+            # y im Train-Fenster
+            train_window["VolRef"] = vol_ref.loc[train_window.index]
+            y = _build_y(train_window)
+            train_window = train_window.assign(Target=y).dropna(subset=["Target"])
 
+            if train_window["Target"].nunique() < 2:
+                continue
+
+            X_train = train_window[X_cols].values
+            y_train = train_window["Target"].values.astype(int)
+
+            X_pred = feat[X_cols].iloc[[t]].values
+            probs[t] = fit_predict_proba(X_train, y_train, X_pred, model_params, calibrate, calib_folds)[0]
+
+        feat["SignalProb"] = pd.Series(probs, index=feat.index).ffill().fillna(0.5)
+
+    # Backtest nutzt feat bis vor letzter Zeile
     feat_bt = feat.iloc[:-1].copy()
-
     df_bt, trades = backtest_next_open(
         feat_bt,
-        entry_prob, exit_prob,
-        COMMISSION, SLIPPAGE_BPS,
-        init_capital, pos_frac,
-        min_hold_days=int(min_hold_days),
-        cooldown_days=int(cooldown_days),
+        float(ENTRY_PROB), float(EXIT_PROB),
+        float(COMMISSION), int(SLIPPAGE_BPS),
+        float(INIT_CAP_PER_TICKER),
+        float(POS_FRAC),
+        min_hold_days=int(MIN_HOLD_DAYS),
+        cooldown_days=int(COOLDOWN_DAYS),
     )
-    metrics = compute_performance(df_bt, trades, init_capital)
-    return feat, df_bt, trades, metrics
+    metrics = compute_performance(df_bt, trades, float(INIT_CAP_PER_TICKER))
+
+    # Diagnostics: OOS quality (Brier + bucket edge)
+    diag = {}
+    try:
+        # Nur dort, wo wir Label kennen (hist)
+        diag_df = feat.iloc[:-1].copy()
+        diag_df["VolRef"] = vol_ref.loc[diag_df.index]
+        y_all = _build_y(diag_df).astype(float)
+        p_all = pd.to_numeric(diag_df["SignalProb"], errors="coerce")
+
+        m = np.isfinite(y_all.values) & np.isfinite(p_all.values)
+        if m.sum() > 80 and len(np.unique(y_all.values[m].astype(int))) > 1:
+            yv = y_all.values[m].astype(int)
+            pv = p_all.values[m].clip(0.0, 1.0)
+
+            diag["Brier"] = float(brier_score_loss(yv, pv))
+
+            # Bucket edge: oberstes Dezil vs Rest
+            q90 = np.quantile(pv, 0.90)
+            top = pv >= q90
+            mu_top = float(np.nanmean(diag_df.loc[m].loc[top, "FutureRetExec"]))
+            mu_all = float(np.nanmean(diag_df.loc[m, "FutureRetExec"]))
+            diag["Mu_FutureRetExec_top10p"] = mu_top
+            diag["Mu_FutureRetExec_all"] = mu_all
+            diag["Edge_top10p_minus_all"] = mu_top - mu_all
+    except Exception:
+        pass
+
+    return feat, df_bt, trades, metrics, diag
 
 
 # ─────────────────────────────────────────────────────────────
-# 🧭 Parameter-Optimierung (Random Search mit Walk-Forward-Light)
+# Portfolio Forecast – Bootstrap (Block)
 # ─────────────────────────────────────────────────────────────
-st.subheader("🧭 Parameter-Optimierung")
-with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=False):
-    n_trials = st.number_input("Trials", 10, 1000, 80, step=10)
-    seed = st.number_input("Seed", 0, 10_000, 42)
-    lambda_trades = st.number_input("Penalty λ pro Trade", 0.0, 1.0, 0.02, step=0.005)
-    min_trades_req = st.number_input("Min. Trades gesamt (Filter)", 0, 10000, 5, step=1)
+def bootstrap_portfolio_forecast(
+    rets: pd.DataFrame,
+    nav0: float,
+    horizon_days: int,
+    sims: int,
+    block: int,
+    seed: int = 42
+) -> dict:
+    """
+    Block-Bootstrap auf Return-Vektoren (multivariate historisch, ohne Normalannahme).
+    rets: DataFrame (daily returns, aligned), Spalten=Tickers
+    """
+    rng = np.random.default_rng(int(seed))
+    rets = rets.dropna(how="any")
+    if rets.empty or len(rets) < max(120, horizon_days * 10):
+        raise ValueError("Zu wenig Return-Historie für Bootstrap-Forecast.")
 
-    lb_lo, lb_hi = st.slider("Lookback", 10, 252, (30, 120), step=5)
-    hz_lo, hz_hi = st.slider("Horizon", 1, 10, (3, 8))
-    thr_lo, thr_hi = st.slider("Threshold Target", 0.0, 0.10, (0.035, 0.10), step=0.005, format="%.3f")
-    en_lo, en_hi = st.slider("Entry Prob Range", 0.0, 1.0, (0.55, 0.85), step=0.01)
-    ex_lo, ex_hi = st.slider("Exit Prob Range", 0.0, 1.0, (0.30, 0.60), step=0.01)
+    tickers = rets.columns.tolist()
+    n = len(rets)
+    w = np.ones(len(tickers), dtype=float) / len(tickers)
 
-    @st.cache_data(show_spinner=False)
-    def _get_prices_for_optimizer(tickers: tuple, start: str, end: str, use_tail: bool, interval: str,
-                                  fallback_last: bool, exec_key: str, moc_cutoff: int):
-        return load_all_prices(list(tickers), start, end, use_tail, interval, fallback_last, exec_key, moc_cutoff)[0]
+    H = int(horizon_days)
+    B = max(1, int(block))
+    steps = int(np.ceil(H / B))
 
-    def _sample_params(rng):
-        return dict(
-            lookback = rng.randrange(lb_lo, lb_hi + 1, 5),
-            horizon  = rng.randrange(hz_lo, hz_hi + 1, 1),
-            thresh   = rng.uniform(thr_lo, thr_hi),
-            entry    = rng.uniform(en_lo, en_hi),
-            exit     = rng.uniform(ex_lo, ex_hi),
-        )
+    port_rets = np.empty(int(sims), dtype=float)
 
-    if st.button("🔎 Suche starten", type="primary", use_container_width=True):
-        import random
-        from collections import Counter
+    rets_np = rets.values
+    for s in range(int(sims)):
+        idxs = []
+        for _ in range(steps):
+            start = rng.integers(0, max(1, n - B))
+            idxs.extend(range(start, start + B))
+        idxs = idxs[:H]
+        path = rets_np[idxs, :]  # H x N
+        # Horizon return (compounded)
+        port_path = (1.0 + (path @ w)).prod() - 1.0
+        port_rets[s] = port_path
 
-        rng = random.Random(int(seed))
-        price_map_opt = _get_prices_for_optimizer(
-            tuple(TICKERS), str(START_DATE), str(END_DATE),
-            use_live, intraday_interval, fallback_last_session, exec_mode, int(moc_cutoff_min)
-        )
+    nav_paths = nav0 * (1.0 + port_rets)
+    q = np.quantile(port_rets, [0.05, 0.50, 0.95])
+    q_nav = np.quantile(nav_paths, [0.05, 0.50, 0.95])
 
-        # ✅ Prefilter (spart massiv Zeit & Fehler im Optimizer)
-        prefiltered: Dict[str, pd.DataFrame] = {}
-        min_len_need = max(120, int(wf_min_train) + 40)
-        for tk, df in (price_map_opt or {}).items():
-            if not isinstance(df, pd.DataFrame):
-                continue
-            if len(df) < min_len_need:
-                continue
-            prefiltered[tk] = df.copy()
-
-        if len(prefiltered) < 2:
-            st.error("Optimizer: zu wenige Ticker nach Prefilter.")
-            st.stop()
-
-        feasible_tickers = list(prefiltered.keys())
-
-        # ✅ Schneller Eval: Cache-Features + nur 2-Split WF-light (ohne make_features_and_train Overhead)
-        def _eval_one(df0: pd.DataFrame, p: dict) -> tuple:
-            # Feature-Cache (pro df/params)
-            feat, hist = build_feature_cache(
-                df0,
-                int(p["lookback"]),
-                int(p["horizon"]),
-                float(p["thresh"]),
-            )
-            if feat is None or hist is None or hist["Target"].nunique() < 2:
-                raise ValueError("Feature cache leer / Target degeneriert")
-        
-            X_cols = ["Range", "SlopeHigh", "SlopeLow"]
-        
-            pipe = Pipeline([
-                ("imputer", SimpleImputer(strategy="median")),
-                ("model", GradientBoostingClassifier(**MODEL_PARAMS)),
-            ])
-        
-            # --- 1-Split Walk-Forward light ---
-            n = len(hist)
-            min_train = int(wf_min_train)
-        
-            # train = max(min_train, 60% der Historie), test = Rest
-            split = max(min_train, int(0.6 * n))
-            if n - split < 30:
-                raise ValueError("Keine gültigen Sharpe-Werte")  # OOS zu kurz
-        
-            train = hist.iloc[:split].copy()
-            test_idx = hist.index[split:]  # OOS Index
-        
-            if train["Target"].nunique() < 2:
-                raise ValueError("Feature cache leer / Target degeneriert")
-        
-            pipe.fit(train[X_cols].values, train["Target"].values)
-        
-            # Probas für gesamten Zeitraum, aber Performance NUR auf OOS messen
-            feat["SignalProb"] = pipe.predict_proba(feat[X_cols].values)[:, 1]
-        
-            df_bt, trades = backtest_next_open(
-                feat.iloc[:-1],
-                float(p["entry"]), float(p["exit"]),
-                COMMISSION, SLIPPAGE_BPS,
-                float(INIT_CAP_PER_TICKER),
-                float(POS_FRAC),
-                min_hold_days=int(MIN_HOLD_DAYS),
-                cooldown_days=int(COOLDOWN_DAYS),
-            )
-        
-            # OOS-Performance slice
-            df_oos = df_bt.loc[df_bt.index.intersection(test_idx)]
-            if len(df_oos) < 30:
-                raise ValueError("Keine gültigen Sharpe-Werte")
-        
-            rets = df_oos["Equity_Net"].pct_change().dropna()
-            if rets.empty:
-                raise ValueError("Keine gültigen Sharpe-Werte")
-        
-            sharpe_oos = float((rets.mean() / (rets.std(ddof=0) + 1e-12)) * np.sqrt(252))
-            trades_total = int(sum(1 for t in trades if t["Typ"] == "Exit"))
-        
-            return sharpe_oos, trades_total, 1
-
-
-        rows = []
-        best = None
-        prog = st.progress(0.0)
-        err_counter = Counter()
-        valid_trials = 0
-
-        for t in range(int(n_trials)):
-            p = _sample_params(rng)
-            if p["exit"] >= p["entry"]:
-                prog.progress((t + 1) / int(n_trials))
-                continue
-
-            sharps_all = []
-            trades_total = 0
-            valid_parts_total = 0
-            ok_tickers = 0
-
-            for tk in feasible_tickers:
-                df0 = prefiltered.get(tk)
-                if df0 is None or len(df0) < max(80, int(p["lookback"]) + int(p["horizon"]) + 40):
-                    continue
-                try:
-                    s_med, tr_sum, vparts = _eval_one(df0, p)
-                    sharps_all.append(s_med)
-                    trades_total += tr_sum
-                    valid_parts_total += vparts
-                    ok_tickers += 1
-                except Exception as e:
-                    err_counter[str(e)[:90]] += 1
-
-            if ok_tickers < 2 or len(sharps_all) == 0:
-                prog.progress((t + 1) / int(n_trials))
-                continue
-
-            sharpe_med = float(np.nanmedian(sharps_all))
-            if not np.isfinite(sharpe_med):
-                prog.progress((t + 1) / int(n_trials))
-                continue
-
-            denom = max(1, ok_tickers * max(1, valid_parts_total))
-            trades_scaled = trades_total / denom
-
-            if trades_total < int(min_trades_req):
-                prog.progress((t + 1) / int(n_trials))
-                continue
-
-            score = sharpe_med - float(lambda_trades) * float(trades_scaled)
-
-            rec = dict(
-                trial=t,
-                score=float(score),
-                sharpe_med=float(sharpe_med),
-                trades=int(trades_total),
-                trades_scaled=float(trades_scaled),
-                ok_tickers=int(ok_tickers),
-                **p
-            )
-            rows.append(rec)
-            valid_trials += 1
-            if (best is None) or (rec["score"] > best["score"]):
-                best = rec
-
-            prog.progress((t + 1) / int(n_trials))
-
-        if not rows:
-            st.error("Keine gültigen Kandidaten gefunden – Debug unten.")
-            if err_counter:
-                st.caption("Häufigste Fehler (Top 10):")
-                st.write(pd.DataFrame(err_counter.most_common(10), columns=["Error", "Count"]))
-            st.info(
-                "Schnelle Fixes: "
-                "1) wf_min_train senken (z.B. 60–90), "
-                "2) Lookback/Horizon kleiner, "
-                "3) min_trades_req auf 0–2, "
-                "4) Exit-Range enger unter Entry-Range halten."
-            )
-        else:
-            df_res = pd.DataFrame(rows).sort_values("score", ascending=False)
-            st.success(
-                f"Valid Trials: {valid_trials}/{int(n_trials)} | "
-                f"Beste Score={best['score']:.3f} | Sharpe(med)={best['sharpe_med']:.2f} | Trades={best['trades']}"
-            )
-            c1_, c2_, c3_, c4_, c5_ = st.columns(5)
-            c1_.metric("Lookback", int(best["lookback"]))
-            c2_.metric("Horizon",  int(best["horizon"]))
-            c3_.metric("Target Thresh", f"{best['thresh']:.3f}")
-            c4_.metric("Entry Prob",    f"{best['entry']:.2f}")
-            c5_.metric("Exit Prob",     f"{best['exit']:.2f}")
-
-            st.caption("Top-Ergebnisse (Score = Sharpe_med − λ·Trades_scaled)")
-            st.dataframe(df_res.head(25), use_container_width=True)
-            st.download_button(
-                "Optimierergebnisse als CSV",
-                to_csv_eu(df_res),
-                file_name="param_search_results.csv", mime="text/csv"
-            )
+    return dict(
+        port_ret_q05=float(q[0]), port_ret_q50=float(q[1]), port_ret_q95=float(q[2]),
+        nav_q05=float(q_nav[0]), nav_q50=float(q_nav[1]), nav_q95=float(q_nav[2]),
+        port_rets=port_rets, nav_paths=nav_paths,
+    )
 
 
 # ─────────────────────────────────────────────────────────────
-# Haupt – Pipeline
+# Main
 # ─────────────────────────────────────────────────────────────
-st.markdown("<h1 style='font-size: 36px;'>📈 NEXT LEVEL 2ND AI-MODELL</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='font-size: 36px;'>📈 NEXT LEVEL 2ND AI-MODELL (FIXED)</h1>", unsafe_allow_html=True)
+st.caption(
+    "Wichtig: Modell/Backtest nutzt ausschließlich finale Daily Bars. Intraday wird nur visualisiert. "
+    "Walk-Forward + Embargo ist Standard, damit die Probas OOS-ähnlicher sind."
+)
+
+price_map = load_all_prices_daily(TICKERS, str(START_DATE), str(END_DATE))
 
 results = []
 all_trades: Dict[str, List[dict]] = {}
 all_dfs:   Dict[str, pd.DataFrame] = {}
 all_feat:  Dict[str, pd.DataFrame] = {}
+all_diag:  Dict[str, dict] = {}
 
-price_map, meta_map = load_all_prices(
-    TICKERS, str(START_DATE), str(END_DATE),
-    use_live, intraday_interval, fallback_last_session, exec_mode, int(moc_cutoff_min)
-)
-
-options_live: Dict[str, pd.DataFrame] = {}
-if use_chain_live:
-    st.info("Optionsketten je Aktie einlesen …")
-    prog_opt = st.progress(0.0)
-    tks = list(price_map.keys())
-    for i, tk in enumerate(tks):
-        try:
-            df = price_map[tk]
-            if df is None or df.empty:
-                continue
-            ref = float(df["Close"].iloc[-1])
-            ch = get_equity_chain_aggregates_for_today(tk, ref, atm_band_pct, int(n_expiries), int(max_days_to_exp))
-            if not ch.empty:
-                options_live[tk] = ch
-        except Exception:
-            pass
-        finally:
-            prog_opt.progress((i+1)/max(1,len(tks)))
-
-live_forecasts_run: List[dict] = []
+if not price_map:
+    st.warning("Keine Preisdaten geladen. Prüfe Ticker/Zeitraum.")
+    st.stop()
 
 for ticker in TICKERS:
     if ticker not in price_map:
         continue
+
     df = price_map[ticker]
-    meta = meta_map.get(ticker, {})
     with st.expander(f"🔍 Analyse für {ticker}", expanded=False):
         st.subheader(f"{ticker} — {get_ticker_name(ticker)}")
+
         try:
-            last_timestamp_info(df, meta)
+            last_timestamp_info(df)
 
-            exog_tk = None
-            if use_chain_live and ticker in options_live and not options_live[ticker].empty:
-                ch = options_live[ticker].copy()
-                ch.index = [df.index[-1].normalize()]
-                exog_tk = ch
-
-            feat, df_bt, trades, metrics = make_features_and_train(
-                df, int(LOOKBACK), int(HORIZON), float(THRESH), MODEL_PARAMS,
-                float(ENTRY_PROB), float(EXIT_PROB),
-                init_capital=float(INIT_CAP_PER_TICKER),
-                pos_frac=float(POS_FRAC),
-                min_hold_days=int(MIN_HOLD_DAYS),
-                cooldown_days=int(COOLDOWN_DAYS),
-                exog_df=exog_tk,
+            feat, df_bt, trades, metrics, diag = make_features_and_train(
+                df=df,
+                lookback=int(LOOKBACK),
+                horizon=int(HORIZON),
+                target_mode=str(target_mode),
+                thr_fix=float(THRESH),
+                k_vol=float(k_vol),
+                q_quant=float(q_quant),
+                model_params=MODEL_PARAMS,
                 walk_forward=bool(use_walk_forward),
                 wf_min_train=int(wf_min_train),
+                embargo=int(embargo_bars),
+                calibrate=bool(use_calibration),
+                calib_folds=int(calib_cv),
             )
+
             metrics["Ticker"] = ticker
             results.append(metrics)
             all_trades[ticker] = trades
             all_dfs[ticker] = df_bt
             all_feat[ticker] = feat
+            all_diag[ticker] = diag
 
-            def _decide_action_local(p: float, entry_thr: float, exit_thr: float) -> str:
+            # Live decision (auf letzter Daily-Bar)
+            def decide_action(p: float, entry_thr: float, exit_thr: float) -> str:
                 if p > entry_thr:  return "Enter / Add"
                 if p < exit_thr:   return "Exit / Reduce"
                 return "Hold / No Trade"
 
             live_ts    = pd.Timestamp(feat.index[-1])
             live_prob  = float(feat["SignalProb"].iloc[-1])
-            live_close = float(feat["Close"].iloc[-1]) if "Close" in feat.columns else np.nan
-            tail_info  = "intraday" if meta.get("tail_is_intraday") else "daily"
-
-            row = {
-                "AsOf": live_ts.strftime("%Y-%m-%d %H:%M"),
-                "Ticker": ticker,
-                "Name": get_ticker_name(ticker),
-                f"P(>{THRESH:.3f} in {HORIZON}d)": round(live_prob, 4),
-                "Action": _decide_action_local(live_prob, float(ENTRY_PROB), float(EXIT_PROB)),
-                "Close": round(live_close, 4),
-                "Bar": tail_info,
-            }
-
-            if use_chain_live and exog_tk is not None:
-                vals = exog_tk.iloc[-1]
-                for col in ["PCR_vol","PCR_oi","VOI_call","VOI_put","IV_skew_p_minus_c","VOL_tot","OI_tot"]:
-                    if col in vals and pd.notna(vals[col]):
-                        row[col] = round(float(vals[col]), 4)
-
-            live_forecasts_run.append(row)
+            live_close = float(feat["Close"].iloc[-1])
 
             c1m, c2m, c3m, c4m, c5m, c6m = st.columns(6)
             c1m.metric("Strategie Netto (%)", f"{metrics['Strategy Net (%)']:.2f}")
             c2m.metric("Buy & Hold (%)",      f"{metrics['Buy & Hold Net (%)']:.2f}")
-            c3m.metric("Sharpe",               f"{metrics['Sharpe-Ratio']:.2f}")
-            c4m.metric("Sortino",              f"{metrics['Sortino-Ratio']:.2f}" if np.isfinite(metrics["Sortino-Ratio"]) else "–")
-            c5m.metric("Max DD (%)",           f"{metrics['Max Drawdown (%)']:.2f}")
-            c6m.metric("Trades (Round-Trips)", f"{int(metrics['Number of Trades'])}")
+            c3m.metric("Sharpe",              f"{metrics['Sharpe-Ratio']:.2f}")
+            c4m.metric("Sortino",             f"{metrics['Sortino-Ratio']:.2f}" if np.isfinite(metrics["Sortino-Ratio"]) else "–")
+            c5m.metric("Max DD (%)",          f"{metrics['Max Drawdown (%)']:.2f}")
+            c6m.metric("Aktionssignal",       decide_action(live_prob, float(ENTRY_PROB), float(EXIT_PROB)))
+
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("P(Signal) (letzter Tag)", f"{live_prob:.4f}")
+            if diag:
+                d2.metric("Brier (lower=better)", f"{diag.get('Brier', np.nan):.4f}" if np.isfinite(diag.get("Brier", np.nan)) else "–")
+                d3.metric("Edge top10% (FutureRet)", f"{diag.get('Edge_top10p_minus_all', np.nan)*100:.2f}%" if np.isfinite(diag.get("Edge_top10p_minus_all", np.nan)) else "–")
+                d4.metric("μ(top10%)", f"{diag.get('Mu_FutureRetExec_top10p', np.nan)*100:.2f}%" if np.isfinite(diag.get("Mu_FutureRetExec_top10p", np.nan)) else "–")
+            else:
+                d2.metric("Brier", "–"); d3.metric("Edge top10%", "–"); d4.metric("μ(top10%)", "–")
 
             st.caption(
-                f"Entry/Exit: {'Walk-Forward' if use_walk_forward else 'In-Sample'} "
-                f"| Target: FutureRetExec(Open→Open) > {THRESH:.3f} (in {HORIZON}d)"
+                f"Target-Modus: {target_mode} | WF={'ON' if use_walk_forward else 'OFF'} | Embargo={int(embargo_bars)} | "
+                f"Calibration={'ON' if use_calibration else 'OFF'}"
             )
 
+            # Charts
             chart_cols = st.columns(2)
 
+            # Price + Prob color segments
             df_plot = feat.copy()
             price_fig = go.Figure()
             price_fig.add_trace(go.Scatter(
                 x=df_plot.index, y=df_plot["Close"], mode="lines", name="Close",
-                line=dict(color="rgba(0,0,0,0.4)", width=1),
+                line=dict(color="rgba(0,0,0,0.35)", width=1),
                 hovertemplate="Datum: %{x|%Y-%m-%d}<br>Close: %{y:.2f}<extra></extra>"
             ))
-            signal_probs = df_plot["SignalProb"]
+            signal_probs = df_plot["SignalProb"].clip(0, 1)
             norm = (signal_probs - signal_probs.min()) / (signal_probs.max() - signal_probs.min() + 1e-9)
             for i in range(len(df_plot) - 1):
                 seg_x = df_plot.index[i:i+2]
@@ -1247,24 +916,8 @@ for ticker in TICKERS:
                     x=seg_x, y=seg_y, mode="lines", showlegend=False,
                     line=dict(color=color_seg, width=2), hoverinfo="skip"
                 ))
-
-            trades_df = pd.DataFrame(trades)
-            if not trades_df.empty:
-                trades_df["Date"] = pd.to_datetime(trades_df["Date"])
-                entries = trades_df[trades_df["Typ"]=="Entry"]; exits = trades_df[trades_df["Typ"]=="Exit"]
-                price_fig.add_trace(go.Scatter(
-                    x=entries["Date"], y=entries["Price"], mode="markers", name="Entry",
-                    marker_symbol="triangle-up", marker=dict(size=12, color="green"),
-                    hovertemplate="Entry<br>Datum:%{x|%Y-%m-%d}<br>Preis:%{y:.2f}<extra></extra>"
-                ))
-                price_fig.add_trace(go.Scatter(
-                    x=exits["Date"], y=exits["Price"], mode="markers", name="Exit",
-                    marker_symbol="triangle-down", marker=dict(size=12, color="red"),
-                    hovertemplate="Exit<br>Datum:%{x|%Y-%m-%d}<br>Preis:%{y:.2f}<extra></extra>"
-                ))
-
             price_fig.update_layout(
-                title=f"{ticker}: Preis mit Signal-Wahrscheinlichkeit (Daily)",
+                title=f"{ticker}: Daily Preis + SignalProb",
                 xaxis_title="Datum", yaxis_title="Preis",
                 height=420, margin=dict(t=50, b=30, l=40, r=20),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
@@ -1272,85 +925,71 @@ for ticker in TICKERS:
             with chart_cols[0]:
                 st.plotly_chart(price_fig, use_container_width=True)
 
-            intra = get_intraday_last_n_sessions(ticker, sessions=5, days_buffer=10, interval=intraday_interval)
+            # Intraday chart (Anzeige only)
             with chart_cols[1]:
-                if intra.empty:
-                    st.info("Keine Intraday-Daten verfügbar (Ticker/Intervall/Zeitraum).")
+                if not show_intraday:
+                    st.info("Intraday-Anzeige ist deaktiviert.")
                 else:
-                    intr_fig = go.Figure()
-                    if intraday_chart_type == "Candlestick (OHLC)":
-                        intr_fig.add_trace(go.Candlestick(
-                            x=intra.index, open=intra["Open"], high=intra["High"],
-                            low=intra["Low"],  close=intra["Close"],
-                            name="OHLC (intraday)",
-                            increasing_line_width=1, decreasing_line_width=1
-                        ))
+                    intra = get_intraday_last_n_sessions(ticker, sessions=5, days_buffer=10, interval=intraday_interval)
+                    if intra.empty:
+                        st.info("Keine Intraday-Daten verfügbar (Ticker/Intervall/Zeitraum).")
                     else:
-                        intr_fig.add_trace(go.Scatter(
-                            x=intra.index, y=intra["Close"], mode="lines", name="Close (intraday)",
-                            hovertemplate="%{x|%Y-%m-%d %H:%M}<br>Close: %{y:.2f}<extra></extra>"
-                        ))
-                    intr_fig.update_layout(
-                        title=f"{ticker}: Intraday – letzte 5 Handelstage ({intraday_interval})",
-                        xaxis_title="Zeit", yaxis_title="Preis",
-                        height=420, margin=dict(t=50, b=30, l=40, r=20),
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                    )
-                    st.plotly_chart(intr_fig, use_container_width=True)
+                        intr_fig = go.Figure()
+                        if intraday_chart_type == "Candlestick (OHLC)":
+                            intr_fig.add_trace(go.Candlestick(
+                                x=intra.index, open=intra["Open"], high=intra["High"],
+                                low=intra["Low"], close=intra["Close"],
+                                name="OHLC (intraday)",
+                                increasing_line_width=1, decreasing_line_width=1
+                            ))
+                        else:
+                            intr_fig.add_trace(go.Scatter(
+                                x=intra.index, y=intra["Close"], mode="lines", name="Close (intraday)",
+                                hovertemplate="%{x|%Y-%m-%d %H:%M}<br>Close: %{y:.2f}<extra></extra>"
+                            ))
+                        intr_fig.update_layout(
+                            title=f"{ticker}: Intraday – letzte 5 Sessions ({intraday_interval})",
+                            xaxis_title="Zeit", yaxis_title="Preis",
+                            height=420, margin=dict(t=50, b=30, l=40, r=20),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                        )
+                        st.plotly_chart(intr_fig, use_container_width=True)
 
+            # Equity curve
             eq = go.Figure()
             eq.add_trace(go.Scatter(
                 x=df_bt.index, y=df_bt["Equity_Net"], name="Strategy Net Equity (Next Open)",
                 mode="lines", hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}€<extra></extra>"
             ))
-            bh_curve = INIT_CAP_PER_TICKER * df_bt["Close"] / df_bt["Close"].iloc[0]
+            bh_curve = float(INIT_CAP_PER_TICKER) * df_bt["Close"] / df_bt["Close"].iloc[0]
             eq.add_trace(go.Scatter(
                 x=df_bt.index, y=bh_curve, name="Buy & Hold", mode="lines",
                 line=dict(dash="dash", color="black")
             ))
             eq.update_layout(
-                title=f"{ticker}: Net Equity-Kurve vs. Buy & Hold",
+                title=f"{ticker}: Net Equity vs. Buy & Hold",
                 xaxis_title="Datum", yaxis_title="Equity (€)",
-                height=400, margin=dict(t=50, b=30, l=40, r=20),
+                height=380, margin=dict(t=50, b=30, l=40, r=20),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
             st.plotly_chart(eq, use_container_width=True)
 
-            # ─────────────────────────────────────────────
-            # ▼ Trades (Next Open) – einklappbar
-            # ─────────────────────────────────────────────
-            with st.expander(f"Trades (Next Open) für {ticker}", expanded=True):
-
+            # Trades table
+            with st.expander(f"Trades (Next Open) für {ticker}", expanded=False):
                 trades_df = pd.DataFrame(trades)
-            
                 if trades_df.empty:
                     st.info("Keine Trades für diesen Zeitraum / diese Parameter.")
                 else:
                     td = trades_df.copy()
-            
-                    # Ticker/Name ergänzen (waren in trades nicht enthalten)
                     td["Ticker"] = ticker
-                    td["Name"]   = get_ticker_name(ticker)
-            
-                    # Datum formatieren
+                    td["Name"] = get_ticker_name(ticker)
                     if "Date" in td.columns:
                         td["Date"] = pd.to_datetime(td["Date"]).dt.strftime("%d.%m.%Y")
-            
-                    # Spalten aus Backtest -> UI-Namen mappen
-                    rename_map = {
-                        "Prob": "Signal Prob",
-                        "HoldDays": "Hold (days)",
-                        "Net P&L": "PnL",
-                        "kum P&L": "CumPnL",
-                    }
+                    rename_map = {"Prob": "Signal Prob", "HoldDays": "Hold (days)", "Net P&L": "PnL", "kum P&L": "CumPnL"}
                     td = td.rename(columns={k: v for k, v in rename_map.items() if k in td.columns})
-            
-                    # Wunsch-Spalten (nur die, die wirklich existieren)
                     desired = ["Ticker","Name","Date","Typ","Price","Shares","Signal Prob","Hold (days)","PnL","CumPnL","Fees"]
                     show_cols = [c for c in desired if c in td.columns]
-            
                     st.dataframe(td[show_cols], use_container_width=True)
-            
                     st.download_button(
                         "Trades als CSV",
                         to_csv_eu(td[show_cols]),
@@ -1359,456 +998,183 @@ for ticker in TICKERS:
                         key=f"dl_trades_{ticker}",
                     )
 
-        
         except Exception as e:
             st.error(f"Fehler bei {ticker}: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
-# 🔮 Live-Forecast Board
+# Summary + Portfolio Analytics
 # ─────────────────────────────────────────────────────────────
-if live_forecasts_run:
-    live_df = (
-        pd.DataFrame(live_forecasts_run)
-          .drop_duplicates(subset=["Ticker"], keep="last")
-          .sort_values(["AsOf", "Ticker"])
-          .reset_index(drop=True)
-    )
-
-    live_df["Target_5d"] = (pd.to_numeric(live_df["Close"], errors="coerce") * (1.0 + float(THRESH))).round(2)
-
-    prob_col = f"P(>{THRESH:.3f} in {HORIZON}d)"
-    if prob_col not in live_df.columns:
-        cand = [c for c in live_df.columns if c.startswith("P(") and c.endswith("d)")]
-        if cand:
-            prob_col = cand[0]
-
-    st.markdown(f"### 🟣 Live–Forecast Board – {HORIZON}-Tage Prognose (heute)")
-    styled_live = style_live_board(live_df, prob_col, ENTRY_PROB)
-    show_styled_or_plain(live_df, styled_live)
-
-    st.download_button(
-        "Live-Forecasts als CSV",
-        to_csv_eu(live_df),
-        file_name=f"live_forecasts_today_{HORIZON}d.csv", mime="text/csv"
-    )
-
-
-# ─────────────────────────────────────────────────────────────
-# Summary / Open Positions / Round-Trips / Portfolio / Korrelation / Forecast
-# ─────────────────────────────────────────────────────────────
-if results:
-    summary_df = pd.DataFrame(results).set_index("Ticker")
-
-    if "Phase" in summary_df.columns:
-        summary_df["Phase"] = (
-            summary_df["Phase"]
-            .astype(str).str.strip().str.lower()
-            .replace({"nan": ""})
-            .map(lambda x: "Open" if x == "open" else ("Flat" if x == "flat" else x.capitalize()))
-        )
-
-    summary_df["Net P&L (%)"] = (summary_df["Net P&L (€)"] / float(INIT_CAP_PER_TICKER)) * 100
-
-    total_net_pnl   = float(summary_df["Net P&L (€)"].sum())
-    total_fees      = float(summary_df["Fees (€)"].sum())
-    total_gross_pnl = total_net_pnl + total_fees
-    total_trades    = int(summary_df["Number of Trades"].sum())
-    total_capital   = float(INIT_CAP_PER_TICKER) * len(summary_df)
-
-    total_net_return_pct   = (total_net_pnl / total_capital * 100) if total_capital else np.nan
-    total_gross_return_pct = (total_gross_pnl / total_capital * 100) if total_capital else np.nan
-    bh_total_pct = float(summary_df["Buy & Hold Net (%)"].dropna().mean()) if "Buy & Hold Net (%)" in summary_df.columns else float("nan")
-
-    st.subheader("📊 Summary of all Tickers (Next Open Backtest) — per Ticker Konto")
-    cols = st.columns(4)
-    cols[0].metric("Cumulative Net P&L (€)",  f"{total_net_pnl:,.2f}")
-    cols[1].metric("Cumulative Trading Costs (€)", f"{total_fees:,.2f}")
-    cols[2].metric("Cumulative Gross P&L (€)", f"{total_gross_pnl:,.2f}")
-    cols[3].metric("Total Number of Trades",   f"{int(total_trades)}")
-
-    cols_pct = st.columns(4)
-    cols_pct[0].metric("Strategy Net (%) – total",   f"{total_net_return_pct:.2f}")
-    cols_pct[1].metric("Strategy Gross (%) – total", f"{total_gross_return_pct:.2f}")
-    cols_pct[2].metric("Buy & Hold Net (%) – total", f"{bh_total_pct:.2f}")
-    cols_pct[3].metric("Durchschn. CAGR (%)", f"{summary_df['CAGR (%)'].dropna().mean():.2f}" if "CAGR (%)" in summary_df else "–")
-
-    def phase_style(val):
-        v = str(val).strip().lower()
-        if v == "open":
-            return "background-color:#d0ebff; color:#1f77b4; font-weight:800;"
-        if v == "flat":
-            return "background-color:#f0f0f0; color:#666;"
-        return ""
-
-    styled_sum = (
-        summary_df.style
-        .format({
-            "Strategy Net (%)":"{:.2f}","Strategy Gross (%)":"{:.2f}",
-            "Buy & Hold Net (%)":"{:.2f}","Volatility (%)":"{:.2f}",
-            "Sharpe-Ratio":"{:.2f}","Sortino-Ratio":"{:.2f}",
-            "Max Drawdown (%)":"{:.2f}","Calmar-Ratio":"{:.2f}",
-            "Fees (€)":"{:.2f}","Net P&L (%)":"{:.2f}","Net P&L (€)":"{:.2f}",
-            "CAGR (%)":"{:.2f}","Winrate (%)":"{:.2f}",
-            "InitCap (€)":"{:.2f}"
-        })
-        .set_caption("Strategy-Performance per Ticker (Next Open Execution)")
-    )
-    if "Phase" in summary_df.columns:
-        styled_sum = styled_sum.applymap(phase_style, subset=["Phase"])
-    show_styled_or_plain(summary_df, styled_sum)
-
-    st.download_button(
-        "Summary als CSV herunterladen",
-        to_csv_eu(summary_df.reset_index()),
-        file_name="strategy_summary.csv", mime="text/csv"
-    )
-
-    # Open Positions
-    st.subheader("📋 Open Positions (Next Open Backtest)")
-    open_positions = []
-    for ticker, trades in all_trades.items():
-        if trades and trades[-1]["Typ"] == "Entry":
-            last_entry = next(t for t in reversed(trades) if t["Typ"] == "Entry")
-            entry_ts = pd.to_datetime(last_entry["Date"])
-            prob = float(all_feat[ticker]["SignalProb"].iloc[-1])
-            last_close = float(all_dfs[ticker]["Close"].iloc[-1])
-            upnl = (last_close - float(last_entry["Price"])) * float(last_entry["Shares"])
-            open_positions.append({
-                "Ticker": ticker, "Name": get_ticker_name(ticker),
-                "Entry Date": entry_ts,
-                "Entry Price": round(float(last_entry["Price"]), 2),
-                "Current Prob.": round(prob, 4),
-                "Unrealized PnL (€)": round(upnl, 2),
-            })
-
-    if open_positions:
-        open_df = pd.DataFrame(open_positions).sort_values("Entry Date", ascending=False)
-        open_df_display = open_df.copy()
-        open_df_display["Entry Date"] = open_df_display["Entry Date"].dt.strftime("%Y-%m-%d")
-        st.dataframe(open_df_display, use_container_width=True)
-        st.download_button("Offene Positionen als CSV", to_csv_eu(open_df), file_name="open_positions.csv", mime="text/csv")
-    else:
-        st.success("Keine offenen Positionen.")
-
-    rt_df = compute_round_trips(all_trades)
-    if not rt_df.empty:
-        st.subheader("🔁 Abgeschlossene Trades (Round-Trips)")
-        st.dataframe(rt_df.sort_values("Exit Date", ascending=False), use_container_width=True)
-        st.download_button("Round-Trips als CSV", to_csv_eu(rt_df), file_name="round_trips.csv", mime="text/csv")
-
-    # ─────────────────────────────────────────────────────────────
-    # 📊 Verteilung der Round-Trip-Ergebnisse
-    # ─────────────────────────────────────────────────────────────
-    if not rt_df.empty:
-        st.markdown("## 📊 Verteilung der Round-Trip-Ergebnisse")
-
-        bins = st.slider("Anzahl Bins", 10, 120, 30, step=5, key="rt_bins_slider")
-
-        rt_ret = pd.to_numeric(rt_df.get("Return (%)"), errors="coerce").dropna()
-        rt_pnl = pd.to_numeric(rt_df.get("PnL Net (€)"), errors="coerce").dropna()
-
-        n_trades = int(len(rt_ret)) if len(rt_ret) else int(len(rt_df))
-        winrate = float((rt_ret > 0).mean()) if len(rt_ret) else float("nan")
-        avg_ret = float(rt_ret.mean()) if len(rt_ret) else float("nan")
-        med_ret = float(rt_ret.median()) if len(rt_ret) else float("nan")
-        std_ret = float(rt_ret.std(ddof=0)) if len(rt_ret) else float("nan")
-
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Anzahl", f"{n_trades}")
-        k2.metric("Winrate", f"{winrate*100:.2f}%" if np.isfinite(winrate) else "–")
-        k3.metric("Ø Return", f"{avg_ret:.2f}%" if np.isfinite(avg_ret) else "–")
-        k4.metric("Median", f"{med_ret:.2f}%" if np.isfinite(med_ret) else "–")
-        k5.metric("Std-Abw.", f"{std_ret:.2f}%" if np.isfinite(std_ret) else "–")
-
-        colL, colR = st.columns(2)
-
-        with colL:
-            st.markdown("### Histogramm: Return (%)")
-            if rt_ret.empty:
-                st.info("Keine Return-Werte vorhanden.")
-            else:
-                fig_ret = go.Figure()
-                fig_ret.add_trace(go.Histogram(x=rt_ret, nbinsx=int(bins), marker_line_width=0))
-                if np.isfinite(avg_ret):
-                    fig_ret.add_vline(x=avg_ret, line_dash="dash", opacity=0.8)
-                if np.isfinite(med_ret):
-                    fig_ret.add_vline(x=med_ret, line_dash="dot", opacity=0.8)
-                fig_ret.update_layout(
-                    height=420,
-                    xaxis_title="Return (%)",
-                    yaxis_title="Häufigkeit",
-                    showlegend=False,
-                    margin=dict(t=40, b=40, l=40, r=20),
-                )
-                st.plotly_chart(fig_ret, use_container_width=True)
-
-        with colR:
-            st.markdown("### Histogramm: PnL Net (€)")
-            if rt_pnl.empty:
-                st.info("Keine PnL-Werte vorhanden.")
-            else:
-                avg_pnl = float(rt_pnl.mean())
-                med_pnl = float(rt_pnl.median())
-
-                fig_pnl = go.Figure()
-                fig_pnl.add_trace(go.Histogram(x=rt_pnl, nbinsx=int(bins), marker_line_width=0))
-                if np.isfinite(avg_pnl):
-                    fig_pnl.add_vline(x=avg_pnl, line_dash="dash", opacity=0.8)
-                if np.isfinite(med_pnl):
-                    fig_pnl.add_vline(x=med_pnl, line_dash="dot", opacity=0.8)
-                fig_pnl.update_layout(
-                    height=420,
-                    xaxis_title="PnL Net (€)",
-                    yaxis_title="Häufigkeit",
-                    showlegend=False,
-                    margin=dict(t=40, b=40, l=40, r=20),
-                )
-                st.plotly_chart(fig_pnl, use_container_width=True)
-
-        st.download_button(
-            "Round-Trips (inkl. Return & PnL) als CSV",
-            to_csv_eu(rt_df),
-            file_name="round_trips_distribution.csv",
-            mime="text/csv",
-            key="dl_rt_distribution",
-        )
-
-    # ─────────────────────────────────────────────────────────────
-    # 📈 Portfolio – Equal-Weight Performance (Close-to-Close)
-    # ─────────────────────────────────────────────────────────────
-    st.markdown("### 📈 Portfolio – Equal-Weight Performance (Close-to-Close)")
-
-    price_series = []
-    for tk, dfbt in all_dfs.items():
-        if isinstance(dfbt, pd.DataFrame) and "Close" in dfbt.columns and len(dfbt) >= 2:
-            s = dfbt["Close"].copy()
-            s.name = tk
-            try:
-                if getattr(s.index, "tz", None) is not None:
-                    s.index = s.index.tz_localize(None)
-            except Exception:
-                pass
-            s.index = pd.to_datetime(s.index).normalize()
-            price_series.append(s)
-
-    prices_port = pd.DataFrame()
-    port_ret = pd.Series(dtype=float)
-
-    if len(price_series) < 2:
-        st.info("Portfolio-Analytics: Mindestens zwei Ticker mit Close-Daten nötig.")
-    else:
-        prices_port = pd.concat(price_series, axis=1, join="outer").sort_index()
-        rets = prices_port.pct_change()
-
-        valid = rets.notna().sum(axis=1) >= 2
-        rets2 = rets.loc[valid].copy()
-
-        if rets2.empty:
-            st.info("Portfolio-Returns sind leer (zu wenig Overlap).")
-        else:
-            w_row = rets2.notna().astype(float)
-            w_row = w_row.div(w_row.sum(axis=1), axis=0)
-            port_ret = (rets2.fillna(0.0) * w_row).sum(axis=1).dropna()
-
-            if port_ret.empty:
-                st.info("Portfolio-Returns sind leer (nach Renormalisierung).")
-            else:
-                ann_return = (1.0 + port_ret).prod() ** (252 / len(port_ret)) - 1.0
-                ann_vol = port_ret.std(ddof=0) * np.sqrt(252)
-                sharpe = (port_ret.mean() / (port_ret.std(ddof=0) + 1e-12)) * np.sqrt(252)
-
-                nav0 = float(INIT_CAP_PER_TICKER) * len(summary_df)
-                nav = nav0 * (1.0 + port_ret).cumprod()
-                dd = (nav / nav.cummax()) - 1.0
-                max_dd = float(dd.min())
-
-                c1p, c2p, c3p, c4p = st.columns(4)
-                c1p.metric("Ø Return p.a.", f"{ann_return*100:.2f}%")
-                c2p.metric("Vol p.a.", f"{ann_vol*100:.2f}%")
-                c3p.metric("Sharpe", f"{sharpe:.2f}")
-                c4p.metric("Max Drawdown", f"{max_dd*100:.2f}%")
-
-                fig_nav = go.Figure()
-                fig_nav.add_trace(go.Scatter(x=nav.index, y=nav.values, mode="lines", name="Portfolio NAV"))
-                fig_nav.update_layout(
-                    height=380,
-                    title="Portfolio NAV (Equal-Weight, Close-to-Close)",
-                    xaxis_title="Datum", yaxis_title="NAV (€)",
-                    margin=dict(t=45, b=30, l=40, r=20)
-                )
-                st.plotly_chart(fig_nav, use_container_width=True)
-
-                st.download_button(
-                    "Portfolio-Returns (daily) als CSV",
-                    to_csv_eu(pd.DataFrame({"Date": port_ret.index, "PortfolioRet": port_ret.values})),
-                    file_name="portfolio_returns_daily.csv",
-                    mime="text/csv",
-                )
-
-    # ─────────────────────────────────────────────────────────────
-    # 🔗 Portfolio-Korrelation (Close-Returns)
-    # ─────────────────────────────────────────────────────────────
-    st.markdown("### 🔗 Portfolio-Korrelation (Close-Returns)")
-
-    if prices_port is None or prices_port.empty or prices_port.shape[1] < 2:
-        st.info("Korrelation: Mindestens zwei Ticker mit Close-Daten nötig.")
-    else:
-        cA, cB, cC, cD = st.columns([1.2, 1.2, 1.8, 1.0])
-
-        with cA:
-            freq_label = st.selectbox("Return-Frequenz", ["täglich", "wöchentlich", "monatlich"], index=0)
-        with cB:
-            corr_method = st.selectbox("Korrelationsmethode", ["Pearson", "Spearman", "Kendall"], index=0)
-        with cC:
-            min_obs = st.slider("Min. gemeinsame Zeitpunkte", min_value=10, max_value=300, value=20, step=5)
-        with cD:
-            use_ffill = st.checkbox("Lücken per FFill schließen", value=True)
-
-        prices_corr = prices_port.copy()
-        if use_ffill:
-            prices_corr = prices_corr.ffill()
-
-        if freq_label == "täglich":
-            prices_corr = prices_corr
-        elif freq_label == "wöchentlich":
-            prices_corr = prices_corr.resample("W").last()
-        else:
-            prices_corr = prices_corr.resample("M").last()
-
-        rets_corr = prices_corr.pct_change().dropna(how="all")
-
-        counts = rets_corr.notna().sum()
-        keep = counts[counts >= int(min_obs)].index.tolist()
-        rets_corr = rets_corr[keep]
-
-        if rets_corr.shape[1] < 2 or rets_corr.empty:
-            st.warning("Zu wenig Overlap nach Filter (min. gemeinsame Zeitpunkte / FFill / Zeitraum prüfen).")
-        else:
-            corr = rets_corr.corr(method=corr_method.lower())
-
-            m = corr.values.copy()
-            np.fill_diagonal(m, np.nan)
-            off = m[np.isfinite(m)]
-
-            pair_avg = float(np.mean(off)) if off.size else float("nan")
-            pair_med = float(np.median(off)) if off.size else float("nan")
-            pair_std = float(np.std(off)) if off.size else float("nan")
-
-            cov = rets_corr.cov()
-            vols = np.sqrt(np.diag(cov.values))
-            n = len(vols)
-            w = np.ones(n) / n
-            port_var = float(w @ cov.values @ w)
-
-            denom = float(np.sum(w[:, None] * w[None, :] * vols[:, None] * vols[None, :])) + 1e-12
-            diag_part = float(np.sum((w**2) * (vols**2)))
-            port_corr_norm = (port_var - diag_part) / denom
-
-            st.caption(
-                f"Basis: {len(rets_corr)} gemeinsame Zeitpunkte · Frequenz: {freq_label} · Methode: {corr_method}"
-            )
-
-            fig_corr = px.imshow(
-                corr.round(2),
-                text_auto=True,
-                aspect="auto",
-                color_continuous_scale="RdBu",
-                zmin=-1,
-                zmax=1,
-                title="Korrelationsmatrix (Close-Returns)",
-            )
-            fig_corr.update_layout(height=520, margin=dict(t=55, b=30, l=40, r=20))
-            st.plotly_chart(fig_corr, use_container_width=True)
-
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Ø Paar-Korrelation", f"{pair_avg:.2f}" if np.isfinite(pair_avg) else "–")
-            k2.metric("Median", f"{pair_med:.2f}" if np.isfinite(pair_med) else "–")
-            k3.metric("Streuung (σ)", f"{pair_std:.2f}" if np.isfinite(pair_std) else "–")
-            k4.metric("Portfolio-Korrelation (normiert)", f"{port_corr_norm:.2f}" if np.isfinite(port_corr_norm) else "–")
-
-            st.download_button(
-                "Korrelationsmatrix als CSV",
-                to_csv_eu(corr.reset_index().rename(columns={"index": "Ticker"})),
-                file_name="portfolio_correlation_matrix.csv",
-                mime="text/csv",
-            )
-
-    # ─────────────────────────────────────────────────────────────
-    # 🔮 Portfolio Forecast
-    # ─────────────────────────────────────────────────────────────
-    st.markdown(f"### 🔮 Portfolio-Renditeprognose (nächste {int(FORECAST_DAYS)} Tage) – Backtest-basiert")
-
-    if prices_port is None or prices_port.empty:
-        st.info("Forecast: Keine Portfolio-Preisdaten verfügbar.")
-    else:
-        rows_fc = []
-        for tk, feat in all_feat.items():
-            est = estimate_expected_return_from_backtest(
-                feat=feat,
-                forecast_days=int(FORECAST_DAYS),
-                threshold=float(THRESH),
-            )
-            if not est:
-                continue
-            rows_fc.append({
-                "Ticker": tk,
-                "Name": get_ticker_name(tk),
-                "p (SignalProb)": est["p"],
-                "μ1 (Target=1)": est["mu1"],
-                "μ0 (Target=0)": est["mu0"],
-                f"E[r {int(FORECAST_DAYS)}d]": est["exp_ret"],
-            })
-
-        if not rows_fc:
-            st.info("Forecast: Nicht genug Daten für eine robuste Schätzung.")
-        else:
-            fc_df = pd.DataFrame(rows_fc).set_index("Ticker")
-            st.dataframe(
-                fc_df.sort_values(f"E[r {int(FORECAST_DAYS)}d]", ascending=False),
-                use_container_width=True
-            )
-
-            exp_rets = fc_df[f"E[r {int(FORECAST_DAYS)}d]"].astype(float).dropna()
-            exp_rets = exp_rets.reindex(prices_port.columns.intersection(exp_rets.index)).dropna()
-
-            if len(exp_rets) < 2:
-                st.info("Forecast: Für Portfolio-Band brauchst du mind. 2 Ticker mit Schätzung.")
-            else:
-                daily_rets = prices_port[exp_rets.index].pct_change().dropna(how="all")
-                cov_daily = daily_rets.cov(min_periods=60)
-                cov_h = cov_daily * float(FORECAST_DAYS)
-
-                nav0_now = float(INIT_CAP_PER_TICKER) * len(summary_df)
-
-                out = portfolio_forecast_mc(
-                    exp_rets=exp_rets,
-                    cov=cov_h,
-                    nav0=nav0_now,
-                    sims=int(MC_SIMS),
-                    seed=42
-                )
-
-                cA, cB, cC = st.columns(3)
-                cA.metric("EW Expected Return", f"{exp_rets.mean()*100:.2f}%")
-                cB.metric("Return 5% / 50% / 95%",
-                          f"{out['port_ret_q05']*100:.2f}% / {out['port_ret_q50']*100:.2f}% / {out['port_ret_q95']*100:.2f}%")
-                cC.metric("NAV 5% / 50% / 95%",
-                          f"{out['nav_q05']:,.0f}€ / {out['nav_q50']:,.0f}€ / {out['nav_q95']:,.0f}€")
-
-                fig_fc = go.Figure(go.Histogram(x=out["port_rets"]*100, nbinsx=40, marker_line_width=0))
-                fig_fc.add_vline(x=out["port_ret_q50"]*100, line_dash="dash", opacity=0.7)
-                fig_fc.add_vline(x=out["port_ret_q05"]*100, line_dash="dot", opacity=0.7)
-                fig_fc.add_vline(x=out["port_ret_q95"]*100, line_dash="dot", opacity=0.7)
-                fig_fc.update_layout(
-                    title=f"Simulierte Portfolio-Returns ({int(FORECAST_DAYS)} Tage, MC={int(MC_SIMS)})",
-                    xaxis_title="Return (%)",
-                    yaxis_title="Häufigkeit",
-                    height=360,
-                    showlegend=False,
-                    margin=dict(t=50, b=40, l=40, r=20),
-                )
-                st.plotly_chart(fig_fc, use_container_width=True)
-
+if not results:
+    st.warning("Noch keine Ergebnisse verfügbar. Prüfe Ticker/Zeitraum.")
+    st.stop()
+
+summary_df = pd.DataFrame(results).set_index("Ticker")
+summary_df["Net P&L (%)"] = (summary_df["Net P&L (€)"] / float(INIT_CAP_PER_TICKER)) * 100
+
+total_net_pnl   = float(summary_df["Net P&L (€)"].sum())
+total_fees      = float(summary_df["Fees (€)"].sum())
+total_gross_pnl = total_net_pnl + total_fees
+total_trades    = int(summary_df["Number of Trades"].sum())
+total_capital   = float(INIT_CAP_PER_TICKER) * len(summary_df)
+total_net_return_pct   = (total_net_pnl / total_capital * 100) if total_capital else np.nan
+total_gross_return_pct = (total_gross_pnl / total_capital * 100) if total_capital else np.nan
+bh_total_pct = float(summary_df["Buy & Hold Net (%)"].dropna().mean())
+
+st.subheader("📊 Summary of all Tickers (Daily data, Next Open backtest)")
+cols = st.columns(4)
+cols[0].metric("Cumulative Net P&L (€)",  f"{total_net_pnl:,.2f}")
+cols[1].metric("Cumulative Trading Costs (€)", f"{total_fees:,.2f}")
+cols[2].metric("Cumulative Gross P&L (€)", f"{total_gross_pnl:,.2f}")
+cols[3].metric("Total Number of Trades",   f"{int(total_trades)}")
+
+cols_pct = st.columns(4)
+cols_pct[0].metric("Strategy Net (%) – total",   f"{total_net_return_pct:.2f}")
+cols_pct[1].metric("Strategy Gross (%) – total", f"{total_gross_return_pct:.2f}")
+cols_pct[2].metric("Buy & Hold Net (%) – avg",   f"{bh_total_pct:.2f}")
+cols_pct[3].metric("Avg CAGR (%)",               f"{summary_df['CAGR (%)'].dropna().mean():.2f}")
+
+st.dataframe(summary_df, use_container_width=True)
+st.download_button(
+    "Summary als CSV herunterladen",
+    to_csv_eu(summary_df.reset_index()),
+    file_name="strategy_summary.csv", mime="text/csv"
+)
+
+# Portfolio (Equal-weight, Close-to-Close)
+st.markdown("### 📈 Portfolio – Equal-Weight Performance (Close-to-Close)")
+
+price_series = []
+for tk, dfbt in all_dfs.items():
+    if isinstance(dfbt, pd.DataFrame) and "Close" in dfbt.columns and len(dfbt) >= 2:
+        s = dfbt["Close"].copy()
+        s.name = tk
+        try:
+            if getattr(s.index, "tz", None) is not None:
+                s.index = s.index.tz_localize(None)
+        except Exception:
+            pass
+        s.index = pd.to_datetime(s.index).normalize()
+        price_series.append(s)
+
+if len(price_series) < 2:
+    st.info("Portfolio-Analytics: Mindestens zwei Ticker mit Close-Daten nötig.")
+    st.stop()
+
+prices_port = pd.concat(price_series, axis=1, join="outer").sort_index()
+rets = prices_port.pct_change()
+
+valid = rets.notna().sum(axis=1) >= 2
+rets2 = rets.loc[valid].copy()
+
+if rets2.empty:
+    st.info("Portfolio-Returns sind leer (zu wenig Overlap).")
+    st.stop()
+
+w_row = rets2.notna().astype(float)
+w_row = w_row.div(w_row.sum(axis=1), axis=0)
+port_ret = (rets2.fillna(0.0) * w_row).sum(axis=1).dropna()
+
+ann_return = (1.0 + port_ret).prod() ** (252 / len(port_ret)) - 1.0
+ann_vol = port_ret.std(ddof=0) * np.sqrt(252)
+sharpe = (port_ret.mean() / (port_ret.std(ddof=0) + 1e-12)) * np.sqrt(252)
+
+nav0 = float(INIT_CAP_PER_TICKER) * len(summary_df)
+nav = nav0 * (1.0 + port_ret).cumprod()
+dd = (nav / nav.cummax()) - 1.0
+max_dd = float(dd.min())
+
+c1p, c2p, c3p, c4p = st.columns(4)
+c1p.metric("Ø Return p.a.", f"{ann_return*100:.2f}%")
+c2p.metric("Vol p.a.", f"{ann_vol*100:.2f}%")
+c3p.metric("Sharpe", f"{sharpe:.2f}")
+c4p.metric("Max Drawdown", f"{max_dd*100:.2f}%")
+
+fig_nav = go.Figure()
+fig_nav.add_trace(go.Scatter(x=nav.index, y=nav.values, mode="lines", name="Portfolio NAV"))
+fig_nav.update_layout(
+    height=360,
+    title="Portfolio NAV (Equal-Weight, Close-to-Close)",
+    xaxis_title="Datum", yaxis_title="NAV (€)",
+    margin=dict(t=45, b=30, l=40, r=20)
+)
+st.plotly_chart(fig_nav, use_container_width=True)
+
+# Correlation
+st.markdown("### 🔗 Portfolio-Korrelation (Close-Returns)")
+freq_label = st.selectbox("Return-Frequenz", ["täglich", "wöchentlich", "monatlich"], index=0)
+corr_method = st.selectbox("Korrelationsmethode", ["Pearson", "Spearman", "Kendall"], index=0)
+min_obs = st.slider("Min. gemeinsame Zeitpunkte", min_value=10, max_value=300, value=20, step=5)
+use_ffill = st.checkbox("Lücken per FFill schließen", value=True)
+
+prices_corr = prices_port.copy()
+if use_ffill:
+    prices_corr = prices_corr.ffill()
+
+if freq_label == "wöchentlich":
+    prices_corr = prices_corr.resample("W").last()
+elif freq_label == "monatlich":
+    prices_corr = prices_corr.resample("M").last()
+
+rets_corr = prices_corr.pct_change().dropna(how="all")
+counts = rets_corr.notna().sum()
+keep = counts[counts >= int(min_obs)].index.tolist()
+rets_corr = rets_corr[keep]
+
+if rets_corr.shape[1] < 2 or rets_corr.empty:
+    st.warning("Zu wenig Overlap nach Filter. Zeitraum/FFill/min_obs prüfen.")
 else:
-    st.warning("Noch keine Ergebnisse verfügbar. Prüfe Ticker-Eingaben und Datenabdeckung.")
+    corr = rets_corr.corr(method=corr_method.lower())
+    fig_corr = px.imshow(
+        corr.round(2),
+        text_auto=True,
+        aspect="auto",
+        color_continuous_scale="RdBu",
+        zmin=-1, zmax=1,
+        title="Korrelationsmatrix (Close-Returns)",
+    )
+    fig_corr.update_layout(height=520, margin=dict(t=55, b=30, l=40, r=20))
+    st.plotly_chart(fig_corr, use_container_width=True)
+    st.download_button(
+        "Korrelationsmatrix als CSV",
+        to_csv_eu(corr.reset_index().rename(columns={"index": "Ticker"})),
+        file_name="portfolio_correlation_matrix.csv",
+        mime="text/csv",
+    )
+
+# Forecast (Bootstrap)
+st.markdown(f"### 🔮 Portfolio-Forecast (Bootstrap, {int(FORECAST_DAYS)} Tage)")
+try:
+    daily_rets = prices_port[rets_corr.columns].pct_change().dropna(how="any")
+    out = bootstrap_portfolio_forecast(
+        rets=daily_rets,
+        nav0=float(nav.iloc[-1]) if len(nav) else nav0,
+        horizon_days=int(FORECAST_DAYS),
+        sims=int(BOOT_SIMS),
+        block=int(block_len),
+        seed=42
+    )
+
+    cA, cB, cC = st.columns(3)
+    cA.metric("Return 5% / 50% / 95%",
+              f"{out['port_ret_q05']*100:.2f}% / {out['port_ret_q50']*100:.2f}% / {out['port_ret_q95']*100:.2f}%")
+    cB.metric("NAV 5% / 50% / 95%",
+              f"{out['nav_q05']:,.0f}€ / {out['nav_q50']:,.0f}€ / {out['nav_q95']:,.0f}€")
+    cC.metric("Bootstrap Sims / Block", f"{int(BOOT_SIMS)} / {int(block_len)}")
+
+    fig_fc = go.Figure(go.Histogram(x=out["port_rets"]*100, nbinsx=40, marker_line_width=0))
+    fig_fc.add_vline(x=out["port_ret_q50"]*100, line_dash="dash", opacity=0.7)
+    fig_fc.add_vline(x=out["port_ret_q05"]*100, line_dash="dot", opacity=0.7)
+    fig_fc.add_vline(x=out["port_ret_q95"]*100, line_dash="dot", opacity=0.7)
+    fig_fc.update_layout(
+        title=f"Simulierte Portfolio-Returns (Bootstrap, {int(FORECAST_DAYS)} Tage)",
+        xaxis_title="Return (%)",
+        yaxis_title="Häufigkeit",
+        height=360,
+        showlegend=False,
+        margin=dict(t=50, b=40, l=40, r=20),
+    )
+    st.plotly_chart(fig_fc, use_container_width=True)
+
+except Exception as e:
+    st.info(f"Forecast nicht möglich: {e}")
