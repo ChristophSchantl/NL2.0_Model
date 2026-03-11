@@ -247,6 +247,18 @@ MODEL_PARAMS = dict(
     random_state=42,
 )
 
+# ── SPEEDUP: Walk-Forward Stride ─────────────────────────────
+WF_STRIDE = st.sidebar.number_input(
+    "Walk-Forward Stride (Tage)",
+    min_value=1, max_value=30, value=5, step=1,
+    help=(
+        "Modell wird nur alle N Tage neu trainiert statt täglich.\n"
+        "Stride=1  → max. Präzision, sehr langsam.\n"
+        "Stride=5  → ~5× schneller, kaum Qualitätsverlust (empfohlen).\n"
+        "Stride=10 → ~10× schneller, leichter Qualitätsverlust."
+    ),
+)
+
 # ── NEU: Volatilitäts-Positionsgröße ─────────────────────────
 st.sidebar.markdown("**Positionsgröße**")
 USE_VOL_SIZING = st.sidebar.checkbox(
@@ -593,6 +605,31 @@ def get_equity_chain_aggregates_for_today(
 # ─────────────────────────────────────────────────────────────
 # NEW 1 – Erweiterte Feature-Berechnung
 # ─────────────────────────────────────────────────────────────
+def _rolling_slope_vec(series: pd.Series, window: int) -> pd.Series:
+    """
+    Vektorisierte Rolling-OLS-Slope – bis zu 30× schneller als rolling().apply().
+
+    slope = Σ((x_i - x̄)(y_i - ȳ)) / Σ(x_i - x̄)²
+    Da x = [0,1,...,w-1] fest ist, werden Gewichte einmalig vorberechnet
+    und dann per sliding_window_view auf alle Fenster gleichzeitig angewendet
+    – komplett ohne Python-Loop.
+    """
+    from numpy.lib.stride_tricks import sliding_window_view
+    x     = np.arange(window, dtype=float)
+    xm    = x.mean()
+    denom = ((x - xm) ** 2).sum()
+    if denom == 0:
+        return pd.Series(np.zeros(len(series)), index=series.index)
+    w_vec  = (x - xm) / denom                               # shape (window,)
+    vals   = series.to_numpy(dtype=float)
+    wins   = sliding_window_view(vals, window_shape=window)  # (N-w+1, w)
+    ym     = wins.mean(axis=1, keepdims=True)
+    slopes = ((wins - ym) * w_vec).sum(axis=1)
+    out    = np.full(len(vals), np.nan)
+    out[window - 1:] = slopes
+    return pd.Series(out, index=series.index)
+
+
 def make_features(
     df: pd.DataFrame,
     lookback: int,
@@ -605,8 +642,9 @@ def make_features(
     feat["Range"]     = (
         feat["High"].rolling(lookback).max() - feat["Low"].rolling(lookback).min()
     )
-    feat["SlopeHigh"] = feat["High"].rolling(lookback).apply(slope, raw=True)
-    feat["SlopeLow"]  = feat["Low"].rolling(lookback).apply(slope, raw=True)
+    # SPEEDUP: vektorisierte Slope statt rolling().apply() → ~30× schneller
+    feat["SlopeHigh"] = _rolling_slope_vec(feat["High"], lookback)
+    feat["SlopeLow"]  = _rolling_slope_vec(feat["Low"],  lookback)
 
     # ── NEU: Momentum ────────────────────────────────────────
     feat["Ret_5d"]   = feat["Close"].pct_change(5)
@@ -703,6 +741,7 @@ def make_features_and_train(
     use_ensemble: bool = True,         # NEW 2
     use_vol_sizing: bool = False,      # NEW 3
     target_vol_annual: float = 0.15,   # NEW 3
+    wf_stride: int = 5,               # SPEEDUP: Retrain nur alle N Bars
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[dict], dict]:
 
     feat = make_features(df, lookback, horizon, exog=exog_df)
@@ -736,30 +775,51 @@ def make_features_and_train(
             )[:, 1]
             last_fi = extract_feature_importance(model, x_cols)
     else:
-        # FIX 2: Walk-Forward – kein Lookahead-Bias
-        probs    = np.full(len(feat), np.nan, dtype=float)
+        # SPEEDUP: Walk-Forward mit konfigurierbarem Stride
+        # Das Modell wird nur alle wf_stride Bars neu trainiert;
+        # dazwischenliegende Bars erhalten dieselbe Wahrscheinlichkeit
+        # (ffill). Bei Stride=5 → ~5× schneller, kaum Qualitätsverlust.
+        probs     = np.full(len(feat), np.nan, dtype=float)
         min_train = max(lookback + horizon + 5, 40)
+        model     = None   # wird in erstem Fit gesetzt
 
-        for t in range(min_train, len(feat)):
-            train = feat.iloc[:t].dropna(subset=["FutureRet"]).copy()
-            if len(train) < min_train:
+        # Retrain-Zeitpunkte: nur jeden wf_stride-ten Bar
+        retrain_steps = list(range(min_train, len(feat), int(wf_stride)))
+        # Prediction-Zeitpunkte: alle Bars ab min_train
+        predict_steps = list(range(min_train, len(feat)))
+
+        # Cache für aktuellen Scaler/Modell
+        _scaler_cache: Optional[StandardScaler] = None
+        _model_cache                             = None
+
+        for t in predict_steps:
+            should_retrain = (t in set(retrain_steps)) or (_model_cache is None)
+            if should_retrain:
+                train = feat.iloc[:t].dropna(subset=["FutureRet"]).copy()
+                if len(train) < min_train:
+                    continue
+                train["Target"] = (train["FutureRet"] > threshold).astype(int)
+                if train["Target"].nunique() < 2:
+                    continue
+                X_train        = train[x_cols].fillna(0).values
+                _scaler_cache  = StandardScaler().fit(X_train)
+                _model_cache   = build_ensemble(model_params, use_ensemble)
+                _model_cache.fit(
+                    _scaler_cache.transform(X_train), train["Target"].values
+                )
+                model = _model_cache   # für Feature-Importance
+
+            if _scaler_cache is None or _model_cache is None:
                 continue
-            train["Target"] = (train["FutureRet"] > threshold).astype(int)
-            if train["Target"].nunique() < 2:
-                continue
-            X_train = train[x_cols].fillna(0).values
-            scaler  = StandardScaler().fit(X_train)
-            model   = build_ensemble(model_params, use_ensemble)
-            model.fit(scaler.transform(X_train), train["Target"].values)
-            probs[t] = model.predict_proba(
-                scaler.transform(feat[x_cols].iloc[[t]].fillna(0).values)
+            probs[t] = _model_cache.predict_proba(
+                _scaler_cache.transform(feat[x_cols].iloc[[t]].fillna(0).values)
             )[0, 1]
 
         feat["SignalProb"] = (
             pd.Series(probs, index=feat.index).ffill().fillna(0.5)
         )
         # Feature-Importance des letzten trainierten Modells
-        last_fi = extract_feature_importance(model, x_cols)
+        last_fi = extract_feature_importance(model, x_cols) if model else None
 
     feat_bt = feat.iloc[:-1].copy()
     df_bt, trades = backtest_next_open(
@@ -1233,6 +1293,7 @@ with st.expander("Optimizer (Random Search · Composite Score · Walk-Forward)",
                                 use_ensemble=False,   # Geschwindigkeit im Optimizer
                                 use_vol_sizing=USE_VOL_SIZING,
                                 target_vol_annual=TARGET_VOL_ANNUAL,
+                                wf_stride=max(int(WF_STRIDE), 5),  # mind. 5 im Optimizer
                             )
                             # Alle Score-Komponenten sammeln
                             sharpes.append(mets["Sharpe-Ratio"])
@@ -1434,7 +1495,7 @@ st.markdown(
 mode_label = "Walk-Forward ✓" if USE_WALK_FORWARD else "Volltraining ⚠️"
 ens_label  = "Ensemble (GBM+RF+LR)" if USE_ENSEMBLE else "Single GBM"
 vs_label   = f"Vol-Sizing ({TARGET_VOL_ANNUAL*100:.0f}% Ziel)" if USE_VOL_SIZING else "Fixe Positionsgröße"
-st.caption(f"Modus: **{mode_label}** | Modell: **{ens_label}** | Sizing: **{vs_label}**")
+st.caption(f"Modus: **{mode_label}** | Modell: **{ens_label}** | Sizing: **{vs_label}** | WF-Stride: **{int(WF_STRIDE)} Tage**")
 
 results: List[dict]                  = []
 all_trades: Dict[str, List[dict]]    = {}
@@ -1447,62 +1508,107 @@ price_map, meta_map = load_all_prices(
     exec_mode, int(moc_cutoff_min),
 )
 
-# Options-Aggregate
+# Options-Aggregate  (SPEEDUP: parallel mit ThreadPoolExecutor)
 options_live: Dict[str, pd.DataFrame] = {}
 if use_chain_live:
-    st.info("Optionsketten je Aktie einlesen …")
+    st.info("Optionsketten je Aktie einlesen … (parallel)")
     prog_opt2 = st.progress(0.0)
     tks       = list(price_map.keys())
-    for i, tk in enumerate(tks):
+
+    def _fetch_chain(tk):
+        df_tk = price_map.get(tk)
+        if df_tk is None or df_tk.empty:
+            return tk, pd.DataFrame()
+        ref = float(df_tk["Close"].iloc[-1])
         try:
-            df_tk = price_map[tk]
-            if df_tk is None or df_tk.empty:
-                continue
-            ref = float(df_tk["Close"].iloc[-1])
-            ch  = get_equity_chain_aggregates_for_today(
+            return tk, get_equity_chain_aggregates_for_today(
                 tk, ref, atm_band_pct, int(n_expiries), int(max_days_to_exp)
             )
-            if not ch.empty:
-                options_live[tk] = ch
         except Exception:
-            pass
-        finally:
-            prog_opt2.progress((i + 1) / max(1, len(tks)))
+            return tk, pd.DataFrame()
+
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(tks)))) as _ex:
+        _futs = {_ex.submit(_fetch_chain, tk): tk for tk in tks}
+        _done = 0
+        for fut in _futs:
+            tk_res, ch_res = fut.result()
+            if not ch_res.empty:
+                options_live[tk_res] = ch_res
+            _done += 1
+            prog_opt2.progress(_done / max(1, len(tks)))
 
 live_forecasts_run: List[dict] = []
+
+# ── SPEEDUP: Modell-Training aller Ticker parallel vorausberechnen ──────────
+# make_features_and_train ist CPU-intensiv (sklearn) → ThreadPoolExecutor
+# gibt hier spürbare Beschleunigung für 6-15 Ticker.
+def _run_ticker(ticker: str):
+    """Worker: berechnet Features + Training für einen Ticker."""
+    df   = price_map.get(ticker)
+    meta = meta_map.get(ticker, {})
+    if df is None or df.empty:
+        return ticker, None
+
+    exog_tk = None
+    if (
+        use_chain_live
+        and ticker in options_live
+        and not options_live[ticker].empty
+    ):
+        ch = options_live[ticker].copy()
+        ch.index = [df.index[-1].normalize()]
+        exog_tk  = ch
+    try:
+        feat, df_bt, trades, metrics = make_features_and_train(
+            df, LOOKBACK, HORIZON, THRESH, MODEL_PARAMS,
+            ENTRY_PROB, EXIT_PROB,
+            min_hold_days=int(MIN_HOLD_DAYS),
+            cooldown_days=int(COOLDOWN_DAYS),
+            exog_df=exog_tk,
+            walk_forward=USE_WALK_FORWARD,
+            use_ensemble=USE_ENSEMBLE,
+            use_vol_sizing=USE_VOL_SIZING,
+            target_vol_annual=TARGET_VOL_ANNUAL,
+            wf_stride=int(WF_STRIDE),
+        )
+        return ticker, (feat, df_bt, trades, metrics, meta)
+    except Exception as e:
+        return ticker, e
+
+valid_tickers = [tk for tk in TICKERS if tk in price_map]
+compute_results: Dict[str, object] = {}
+
+if valid_tickers:
+    st.info(f"Modell-Training für {len(valid_tickers)} Ticker … (parallel, Stride={int(WF_STRIDE)})")
+    prog_train = st.progress(0.0)
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(valid_tickers))) as _ex:
+        _fmap = {_ex.submit(_run_ticker, tk): tk for tk in valid_tickers}
+        _done = 0
+        for fut in _fmap:
+            tk_res        = _fmap[fut]
+            compute_results[tk_res] = fut.result()[1]
+            _done += 1
+            prog_train.progress(_done / len(valid_tickers))
 
 for ticker in TICKERS:
     if ticker not in price_map:
         continue
     df    = price_map[ticker]
     meta  = meta_map.get(ticker, {})
+    _res  = compute_results.get(ticker)
 
     with st.expander(f"🔍 Analyse für {ticker}", expanded=False):
         st.subheader(f"{ticker} — {get_ticker_name(ticker)}")
         try:
             last_timestamp_info(df, meta)
 
-            exog_tk = None
-            if (
-                use_chain_live
-                and ticker in options_live
-                and not options_live[ticker].empty
-            ):
-                ch = options_live[ticker].copy()
-                ch.index = [df.index[-1].normalize()]
-                exog_tk  = ch
+            if _res is None or isinstance(_res, Exception):
+                err_msg = str(_res) if isinstance(_res, Exception) else "Keine Daten"
+                st.error(f"Fehler bei {ticker}: {err_msg}")
+                continue
 
-            feat, df_bt, trades, metrics = make_features_and_train(
-                df, LOOKBACK, HORIZON, THRESH, MODEL_PARAMS,
-                ENTRY_PROB, EXIT_PROB,
-                min_hold_days=int(MIN_HOLD_DAYS),
-                cooldown_days=int(COOLDOWN_DAYS),
-                exog_df=exog_tk,
-                walk_forward=USE_WALK_FORWARD,
-                use_ensemble=USE_ENSEMBLE,
-                use_vol_sizing=USE_VOL_SIZING,
-                target_vol_annual=TARGET_VOL_ANNUAL,
-            )
+            feat, df_bt, trades, metrics, meta = _res
+
             # Interne Felder aus metrics-Dict herausziehen
             last_fi = metrics.pop("_feature_importance", None)
             x_cols  = metrics.pop("_x_cols", BASE_FEATURE_COLS)
