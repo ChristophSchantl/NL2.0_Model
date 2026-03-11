@@ -1571,7 +1571,7 @@ def _run_ticker(ticker: str):
             target_vol_annual=TARGET_VOL_ANNUAL,
             wf_stride=int(WF_STRIDE),
         )
-        return ticker, (feat, df_bt, trades, metrics, meta)
+        return ticker, (feat, df_bt, trades, metrics, meta, exog_tk)
     except Exception as e:
         return ticker, e
 
@@ -1607,7 +1607,7 @@ for ticker in TICKERS:
                 st.error(f"Fehler bei {ticker}: {err_msg}")
                 continue
 
-            feat, df_bt, trades, metrics, meta = _res
+            feat, df_bt, trades, metrics, meta, exog_tk = _res
 
             # Interne Felder aus metrics-Dict herausziehen
             last_fi = metrics.pop("_feature_importance", None)
