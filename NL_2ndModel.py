@@ -1084,20 +1084,81 @@ def show_feature_importance(fi: Optional[pd.Series], x_cols: List[str]) -> None:
 # ─────────────────────────────────────────────────────────────
 # 🧭 Parameter-Optimierung
 # ─────────────────────────────────────────────────────────────
-st.subheader("🧭 Parameter-Optimierung")
-with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=False):
-    n_trials       = st.number_input("Trials", 10, 1000, 80, step=10)
-    seed           = st.number_input("Seed", 0, 10_000, 42)
-    lambda_trades  = st.number_input("Penalty λ pro Trade", 0.0, 1.0, 0.02, step=0.005)
-    min_trades_req = st.number_input("Min. Trades gesamt (Filter)", 0, 10_000, 5, step=1)
+# Score-Funktion (trade-count-unabhängig):
+#   Score = Sharpe × Winrate × (1 + CAGR_norm) − w_dd × |MaxDD|
+#   Alle Komponenten werden als Median über Walk-Forward-Hälften
+#   und alle Ticker aggregiert → robust gegen Einzelausreißer.
+# ─────────────────────────────────────────────────────────────
 
-    lb_lo,  lb_hi  = st.slider("Lookback",            10, 252, (30, 120), step=5)
-    hz_lo,  hz_hi  = st.slider("Horizon",             1,  10,  (3,  8))
-    thr_lo, thr_hi = st.slider(
-        "Threshold Target", 0.0, 0.10, (0.035, 0.10), step=0.005, format="%.3f"
+def _composite_score(
+    sharpe:   float,
+    winrate:  float,   # 0–1
+    cagr:     float,   # z.B. 0.12 für 12%
+    max_dd:   float,   # negativ, z.B. -0.18 für 18% DD
+    w_dd:     float,   # Gewicht für DD-Abzug (Sidebar)
+) -> float:
+    """
+    Kombinierter Score ohne jegliche Trade-Count-Bedingung.
+
+    Logik:
+      - Sharpe:  Kern-Metrik (risikoadjustierte Rendite)
+      - Winrate: Multiplikator – filtert Glücks-Strategien
+                 (1 großer Win, viele Verluste)
+      - CAGR:   Bonus für tatsächliches Kapitalwachstum,
+                normiert auf [-1, +∞) damit 0% CAGR neutral ist
+      - MaxDD:  Direkter Abzug – hohe Drawdowns werden
+                unabhängig vom Sharpe bestraft
+    """
+    if not (np.isfinite(sharpe) and np.isfinite(winrate)
+            and np.isfinite(cagr) and np.isfinite(max_dd)):
+        return float("-inf")
+    # winrate als Faktor: 0.5 = neutral, >0.5 = Bonus, <0.5 = Malus
+    wr_factor   = winrate * 2.0          # 0→0, 0.5→1.0, 1→2.0
+    cagr_bonus  = 1.0 + max(cagr, -1.0) # nie unter 0
+    dd_penalty  = w_dd * abs(max_dd)     # max_dd ist negativ
+    return sharpe * wr_factor * cagr_bonus - dd_penalty
+
+
+st.subheader("🧭 Parameter-Optimierung")
+with st.expander("Optimizer (Random Search · Composite Score · Walk-Forward)", expanded=False):
+
+    st.markdown(
+        "**Score = Sharpe × (2 × Winrate) × (1 + CAGR) − w_DD × |MaxDD|**  \n"
+        "Keine Trade-Anzahl-Bedingung – die Strategie wird rein nach "
+        "Qualität der Ergebnisse bewertet.",
+        help=(
+            "Sharpe: Kern-Metrik\n"
+            "Winrate: Multiplikator (>50% = Bonus)\n"
+            "CAGR: Wachstumsbonus\n"
+            "MaxDD: Drawdown-Abzug (Gewicht w_DD einstellbar)"
+        ),
     )
-    en_lo, en_hi = st.slider("Entry Prob Range", 0.0, 1.0, (0.55, 0.85), step=0.01)
-    ex_lo, ex_hi = st.slider("Exit Prob Range",  0.0, 1.0, (0.30, 0.60), step=0.01)
+
+    # ── Score-Gewichte ────────────────────────────────────────
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        w_dd_penalty = st.number_input(
+            "Drawdown-Gewicht w_DD",
+            min_value=0.0, max_value=10.0, value=1.5, step=0.1, format="%.1f",
+            help=(
+                "Wie stark wird ein hoher Max-Drawdown bestraft?\n"
+                "0 = ignorieren · 1 = linear · 2 = doppelt gewichtet"
+            ),
+        )
+    with sc2:
+        n_trials = st.number_input("Trials", 10, 2000, 150, step=10)
+
+    seed = st.number_input("Seed (Reproduzierbarkeit)", 0, 10_000, 42)
+
+    # ── Suchraum ──────────────────────────────────────────────
+    st.markdown("**Suchraum**")
+    lb_lo,  lb_hi  = st.slider("Lookback",         10, 252, (20, 120), step=5)
+    hz_lo,  hz_hi  = st.slider("Horizon",          1,  10,  (3,  8))
+    thr_lo, thr_hi = st.slider(
+        "Threshold Target", 0.0, 0.10, (0.030, 0.10), step=0.005, format="%.3f"
+    )
+    en_lo, en_hi = st.slider("Entry Prob Range", 0.0, 1.0, (0.50, 0.90), step=0.01)
+    ex_lo, ex_hi = st.slider("Exit Prob Range",  0.0, 1.0, (0.25, 0.65), step=0.01)
 
     @st.cache_data(show_spinner=False)
     def _get_prices_for_optimizer(
@@ -1107,7 +1168,7 @@ with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=Fa
     ):
         return load_all_prices(
             list(tickers), start, end, use_tail, interval,
-            fallback_last, exec_key, moc_cutoff
+            fallback_last, exec_key, moc_cutoff,
         )[0]
 
     def _sample_params(rng):
@@ -1115,8 +1176,8 @@ with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=Fa
             lookback=rng.randrange(lb_lo, lb_hi + 1, 5),
             horizon =rng.randrange(hz_lo, hz_hi + 1, 1),
             thresh  =rng.uniform(thr_lo, thr_hi),
-            entry   =rng.uniform(en_lo, en_hi),
-            exit    =rng.uniform(ex_lo, ex_hi),
+            entry   =rng.uniform(en_lo,  en_hi),
+            exit    =rng.uniform(ex_lo,  ex_hi),
         )
 
     if st.button("🔎 Suche starten", type="primary", use_container_width=True):
@@ -1128,7 +1189,8 @@ with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=Fa
             exec_mode, int(moc_cutoff_min),
         )
         rows_opt, best_opt = [], None
-        prog_opt = st.progress(0.0)
+        prog_opt  = st.progress(0.0)
+        status_tx = st.empty()
 
         feasible_tickers = [
             tk for tk, df in price_map_opt.items()
@@ -1139,22 +1201,27 @@ with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=Fa
         else:
             for t in range(int(n_trials)):
                 p = _sample_params(rng)
+
+                # Ungültige Kombination überspringen
                 if p["exit"] >= p["entry"]:
                     prog_opt.progress((t + 1) / n_trials)
                     continue
 
-                sharps, trades_total, feasible = [], 0, 0
+                # Metriken über alle Ticker und beide Hälften sammeln
+                sharpes, winrates, cagrs, dds = [], [], [], []
+                trades_total = 0
+                feasible     = 0
 
                 for tk in feasible_tickers:
                     df = price_map_opt.get(tk)
-                    if df is None or len(df) < max(
-                        60, p["lookback"] + p["horizon"] + 5
-                    ):
+                    min_len = max(60, p["lookback"] + p["horizon"] + 5)
+                    if df is None or len(df) < min_len:
                         continue
                     feasible += 1
                     mid = len(df) // 2
+
                     for sub in (df.iloc[:mid], df.iloc[mid:]):
-                        if len(sub) < max(60, p["lookback"] + p["horizon"] + 5):
+                        if len(sub) < min_len:
                             continue
                         try:
                             _, df_bt, trades_sub, mets = make_features_and_train(
@@ -1163,69 +1230,194 @@ with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=Fa
                                 min_hold_days=int(MIN_HOLD_DAYS),
                                 cooldown_days=int(COOLDOWN_DAYS),
                                 walk_forward=True,
-                                use_ensemble=False,   # Optimizer: nur GBM (Geschwindigkeit)
+                                use_ensemble=False,   # Geschwindigkeit im Optimizer
                                 use_vol_sizing=USE_VOL_SIZING,
                                 target_vol_annual=TARGET_VOL_ANNUAL,
                             )
-                            sharps.append(mets["Sharpe-Ratio"])
+                            # Alle Score-Komponenten sammeln
+                            sharpes.append(mets["Sharpe-Ratio"])
+                            wr = mets.get("Winrate (%)", np.nan)
+                            winrates.append(wr / 100.0 if np.isfinite(wr) else np.nan)
+                            cg = mets.get("CAGR (%)", np.nan)
+                            cagrs.append(cg / 100.0 if np.isfinite(cg) else np.nan)
+                            dds.append(mets.get("Max Drawdown (%)", np.nan) / 100.0)
                             trades_total += int(mets["Number of Trades"])
                         except Exception:
                             pass
 
-                if feasible == 0:
+                if feasible == 0 or not sharpes:
                     prog_opt.progress((t + 1) / n_trials)
                     continue
 
-                sharpe_avg = float(np.nanmedian(sharps)) if sharps else float("nan")
-                denom      = max(1, feasible * 2)
-                trades_avg = trades_total / denom
+                # Median je Komponente → robust gegen Ausreißer
+                sh_med  = float(np.nanmedian(sharpes))
+                wr_med  = float(np.nanmedian(winrates))
+                cg_med  = float(np.nanmedian(cagrs))
+                dd_med  = float(np.nanmedian(dds))
 
-                if trades_total < int(min_trades_req) or not np.isfinite(sharpe_avg):
+                # Composite Score (trade-count-unabhängig)
+                score = _composite_score(
+                    sharpe  = sh_med,
+                    winrate = wr_med,
+                    cagr    = cg_med,
+                    max_dd  = dd_med,
+                    w_dd    = float(w_dd_penalty),
+                )
+
+                if not np.isfinite(score):
                     prog_opt.progress((t + 1) / n_trials)
                     continue
 
-                score = sharpe_avg - float(lambda_trades) * float(trades_avg)
-                rec   = dict(
-                    trial=t, score=score, sharpe_avg=sharpe_avg,
-                    trades=trades_total, **p,
+                rec = dict(
+                    trial       = t,
+                    score       = round(score, 4),
+                    sharpe_med  = round(sh_med, 3),
+                    winrate_med = round(wr_med * 100, 1),
+                    cagr_med    = round(cg_med * 100, 2),
+                    maxdd_med   = round(dd_med * 100, 2),
+                    trades      = trades_total,
+                    **p,
                 )
                 rows_opt.append(rec)
                 if best_opt is None or score > best_opt["score"]:
                     best_opt = rec
 
+                status_tx.caption(
+                    f"Trial {t+1}/{int(n_trials)} | "
+                    f"Bester Score bisher: {best_opt['score']:.3f}"
+                )
                 prog_opt.progress((t + 1) / n_trials)
+
+            status_tx.empty()
 
             if not rows_opt:
                 st.warning("Keine gültigen Kandidaten gefunden.")
             else:
-                df_res = pd.DataFrame(rows_opt).sort_values("score", ascending=False)
-                mask   = (
-                    pd.to_numeric(df_res["trades"], errors="coerce")
-                    .fillna(0).astype(int) >= int(min_trades_req)
+                df_res = (
+                    pd.DataFrame(rows_opt)
+                    .sort_values("score", ascending=False)
+                    .reset_index(drop=True)
                 )
-                df_show = df_res.loc[mask].copy()
-                if df_show.empty:
-                    df_show = df_res.copy()
 
+                # ── Ergebnis-Banner ───────────────────────────
                 st.success(
-                    f"Beste Parameter: Score={best_opt['score']:.3f} "
-                    f"| Sharpe={best_opt['sharpe_avg']:.2f} "
-                    f"| Trades={best_opt['trades']}"
+                    f"✅  Beste Parameter gefunden — "
+                    f"Score **{best_opt['score']:.3f}** | "
+                    f"Sharpe **{best_opt['sharpe_med']:.2f}** | "
+                    f"Winrate **{best_opt['winrate_med']:.1f}%** | "
+                    f"CAGR **{best_opt['cagr_med']:.1f}%** | "
+                    f"MaxDD **{best_opt['maxdd_med']:.1f}%** | "
+                    f"Trades **{best_opt['trades']}**"
                 )
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Lookback",       int(best_opt["lookback"]))
-                c2.metric("Horizon",        int(best_opt["horizon"]))
-                c3.metric("Target Thresh",  f"{best_opt['thresh']:.3f}")
-                c4.metric("Entry Prob",     f"{best_opt['entry']:.2f}")
-                c5.metric("Exit Prob",      f"{best_opt['exit']:.2f}")
 
-                st.caption(
-                    "Top-Ergebnisse (Score = Sharpe − λ·Trades/(Ticker·Hälften))"
+                # ── Parameter-Kacheln ─────────────────────────
+                st.markdown("**▶ Optimale Parameter – direkt übernehmen:**")
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Lookback",      int(best_opt["lookback"]))
+                c2.metric("Horizon",       int(best_opt["horizon"]))
+                c3.metric("Threshold",     f"{best_opt['thresh']:.3f}")
+                c4.metric("Entry Prob",    f"{best_opt['entry']:.2f}")
+                c5.metric("Exit Prob",     f"{best_opt['exit']:.2f}")
+
+                # ── Score-Komponenten Visualisierung ──────────
+                st.markdown("### 📈 Score-Komponenten (Top 25)")
+                top25 = df_res.head(25).copy()
+
+                fig_sc = go.Figure()
+                fig_sc.add_trace(go.Bar(
+                    name="Sharpe (Median)",
+                    x=top25["trial"].astype(str),
+                    y=top25["sharpe_med"],
+                    marker_color="#6366F1",
+                ))
+                fig_sc.add_trace(go.Bar(
+                    name="Winrate % (Median)",
+                    x=top25["trial"].astype(str),
+                    y=top25["winrate_med"],
+                    marker_color="#10B981",
+                    visible="legendonly",
+                ))
+                fig_sc.add_trace(go.Bar(
+                    name="CAGR % (Median)",
+                    x=top25["trial"].astype(str),
+                    y=top25["cagr_med"],
+                    marker_color="#F59E0B",
+                    visible="legendonly",
+                ))
+                fig_sc.add_trace(go.Bar(
+                    name="MaxDD % (Median, negativ gut)",
+                    x=top25["trial"].astype(str),
+                    y=top25["maxdd_med"],
+                    marker_color="#EF4444",
+                    visible="legendonly",
+                ))
+                fig_sc.add_trace(go.Scatter(
+                    name="Composite Score",
+                    x=top25["trial"].astype(str),
+                    y=top25["score"],
+                    mode="lines+markers",
+                    line=dict(color="black", width=2),
+                    marker=dict(size=7),
+                ))
+                fig_sc.update_layout(
+                    barmode="group",
+                    height=380,
+                    margin=dict(t=30, b=40, l=40, r=20),
+                    legend=dict(orientation="h", y=-0.25),
+                    xaxis_title="Trial-Nr.",
+                    yaxis_title="Wert",
                 )
-                st.dataframe(df_show.head(25), use_container_width=True)
+                st.plotly_chart(fig_sc, use_container_width=True)
+
+                # ── Scatter: Sharpe vs Winrate ─────────────────
+                st.markdown("### 🔵 Sharpe vs. Winrate (alle Trials)")
+                fig_sc2 = px.scatter(
+                    df_res,
+                    x="sharpe_med", y="winrate_med",
+                    color="score",
+                    size=df_res["score"].clip(lower=0) + 0.01,
+                    hover_data=["trial", "lookback", "horizon",
+                                "thresh", "entry", "exit",
+                                "cagr_med", "maxdd_med", "trades"],
+                    color_continuous_scale="RdYlGn",
+                    labels={
+                        "sharpe_med":  "Sharpe (Median)",
+                        "winrate_med": "Winrate % (Median)",
+                        "score":       "Score",
+                    },
+                    title="Sharpe vs. Winrate – Farbe = Composite Score",
+                )
+                fig_sc2.update_layout(
+                    height=420, margin=dict(t=45, b=40, l=40, r=20)
+                )
+                st.plotly_chart(fig_sc2, use_container_width=True)
+
+                # ── Ergebnis-Tabelle ──────────────────────────
+                st.caption(
+                    "Score = Sharpe × (2·Winrate) × (1+CAGR) − w_DD·|MaxDD| "
+                    f"(w_DD={w_dd_penalty:.1f}) · Keine Trade-Anzahl-Bedingung"
+                )
+                display_cols = [
+                    "trial", "score", "sharpe_med", "winrate_med",
+                    "cagr_med", "maxdd_med", "trades",
+                    "lookback", "horizon", "thresh", "entry", "exit",
+                ]
+                st.dataframe(
+                    df_res[display_cols].head(25).style.format({
+                        "score":        "{:.4f}",
+                        "sharpe_med":   "{:.3f}",
+                        "winrate_med":  "{:.1f}",
+                        "cagr_med":     "{:.2f}",
+                        "maxdd_med":    "{:.2f}",
+                        "thresh":       "{:.4f}",
+                        "entry":        "{:.3f}",
+                        "exit":         "{:.3f}",
+                    }).background_gradient(subset=["score"], cmap="RdYlGn"),
+                    use_container_width=True,
+                )
                 st.download_button(
                     "Optimierergebnisse als CSV",
-                    to_csv_eu(df_res),
+                    to_csv_eu(df_res[display_cols]),
                     file_name="param_search_results.csv",
                     mime="text/csv",
                 )
