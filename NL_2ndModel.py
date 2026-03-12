@@ -303,6 +303,27 @@ def get_ticker_name(ticker: str) -> str:
     return ticker
 
 
+def _show_opt_df(df: pd.DataFrame, fmt: dict) -> None:
+    """Zeigt Optimizer-Ergebnis-DataFrame mit Farbgradient auf 'score'-Spalte.
+    Fällt bei Render-Fehler sauber auf plain st.dataframe() zurück."""
+    try:
+        styled = df.style.format(fmt)
+        if "score" in df.columns:
+            # Manuell einfärben statt background_gradient (robuster in allen pandas-Versionen)
+            mn, mx = df["score"].min(), df["score"].max()
+            def _score_color(v):
+                if not isinstance(v, (int, float)) or (mx - mn) < 1e-9:
+                    return ""
+                ratio = (v - mn) / (mx - mn)
+                r = int(255 * (1 - ratio))
+                g = int(200 * ratio + 55)
+                return f"background-color: rgb({r},{g},80); color: {'#111' if ratio > 0.3 else '#555'};"
+            styled = styled.map(_score_color, subset=["score"])
+        st.dataframe(styled, use_container_width=True)
+    except Exception:
+        st.dataframe(df, use_container_width=True)
+
+
 def style_live_board(df: pd.DataFrame, prob_col: str, entry_thr: float):
     def _row_color(row):
         act = str(row.get("Action_adj", row.get("Action", ""))).lower()
@@ -1134,11 +1155,11 @@ with st.expander("Optimizer – Grob → Fein · Composite Score", expanded=Fals
                 df_coarse = pd.DataFrame(rows_coarse).sort_values("score", ascending=False)
                 best_k    = df_coarse.head(int(top_k))
                 st.success(f"Grob: Bester Score = {df_coarse['score'].iloc[0]:.3f}")
-                st.dataframe(best_k.style.format({
+                _show_opt_df(best_k, {
                     "score":"{:.4f}","sharpe":"{:.3f}","winrate":"{:.1f}",
                     "cagr":"{:.2f}","maxdd":"{:.2f}","thresh":"{:.4f}",
                     "entry":"{:.3f}","exit":"{:.3f}",
-                }).background_gradient(subset=["score"], cmap="RdYlGn"), use_container_width=True)
+                })
 
                 # ── Stufe 2: Feinsuche ────────────────────────
                 st.markdown("#### Stufe 2 – Feinsuche um Top-Kandidaten")
@@ -1182,14 +1203,11 @@ with st.expander("Optimizer – Grob → Fein · Composite Score", expanded=Fals
                 fig_sc.update_layout(height=400, margin=dict(t=40,b=40,l=40,r=20))
                 st.plotly_chart(fig_sc, use_container_width=True)
 
-                st.dataframe(
-                    df_all.head(30).style.format({
-                        "score":"{:.4f}","sharpe":"{:.3f}","winrate":"{:.1f}",
-                        "cagr":"{:.2f}","maxdd":"{:.2f}","thresh":"{:.4f}",
-                        "entry":"{:.3f}","exit":"{:.3f}",
-                    }).background_gradient(subset=["score"], cmap="RdYlGn"),
-                    use_container_width=True,
-                )
+                _show_opt_df(df_all.head(30), {
+                    "score":"{:.4f}","sharpe":"{:.3f}","winrate":"{:.1f}",
+                    "cagr":"{:.2f}","maxdd":"{:.2f}","thresh":"{:.4f}",
+                    "entry":"{:.3f}","exit":"{:.3f}",
+                })
                 st.download_button(
                     "Optimierergebnisse als CSV", to_csv_eu(df_all),
                     file_name="param_search_results_v3.csv", mime="text/csv",
