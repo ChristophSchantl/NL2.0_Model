@@ -1,81 +1,197 @@
-# streamlit_app.py  –  NEXUS v2  (alle Fixes & Verbesserungen)
-#
-# ── Changelog gegenüber v1 ───────────────────────────────────────────────────
-#  FIX 1  Options-Features werden jetzt dynamisch in X_cols aufgenommen
-#  FIX 2  Walk-Forward als Standard (kein Lookahead-Bias mehr)
-#  FIX 3  Deprecated APIs: .ffill(), Styler.map(), st.query_params
-#  FIX 4  Cooldown Off-by-One korrigiert  (>= → >)
-#  FIX 5  Doppelte trades_df-Definition entfernt
-#  NEW 1  Erweiterte Features: RSI, Ret_5d/20d, MA_ratio, Volatility, Vol_ratio
-#  NEW 2  Ensemble-Modell: GBM + RandomForest + LogisticRegression
-#  NEW 3  Volatilitäts-skalierte Positionsgröße (Kelly-Light)
-#  NEW 4  Feature-Importance-Chart (aus GBM-Teilmodell)
-# ─────────────────────────────────────────────────────────────────────────────
+from __future__ import annotations
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", message=".*figure layout has changed to tight.*")
 
-import streamlit as st
-import yfinance as yf
+import math
+import random
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import numpy as np
 import pandas as pd
-from math import sqrt
-from datetime import datetime, timedelta
-from typing import Tuple, List, Dict, Optional
-from zoneinfo import ZoneInfo
-from concurrent.futures import ThreadPoolExecutor
-
-from sklearn.ensemble import (
-    GradientBoostingClassifier,
-    RandomForestClassifier,
-    VotingClassifier,
-)
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-
-import plotly.graph_objects as go
 import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+import yfinance as yf
+from numpy.lib.stride_tricks import sliding_window_view
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
 
-# ─────────────────────────────────────────────────────────────
-# Global Config
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# PAGE CONFIG + DESIGN TOKENS
+# ═══════════════════════════════════════════════════════════════
+
 st.set_page_config(
-    page_title="NEXUS v2 – Signal-basierte Strategie", layout="wide"
+    page_title="NEXUS Maison v3 — Signal Strategy",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
-LOCAL_TZ   = ZoneInfo("Europe/Zurich")
+
+LOCAL_TZ = ZoneInfo("Europe/Zurich")
 MAX_WORKERS = 8
+TRADING_DAYS = 252
 pd.options.display.float_format = "{:,.4f}".format
 
-# Feste Feature-Listen (werden dynamisch gefiltert)
+GOLD = "#B69D5F"
+GOLD_DEEP = "#9A8243"
+GOLD_PALE = "#EDE4CC"
+STONE = "#F5F1EB"
+INK = "#1E1E1E"
+INK_MID = "#6E6E6E"
+INK_LIGHT = "#9C9C9C"
+RISE = "#4D7C5B"
+FALL = "#944848"
+WHITE = "#FFFFFF"
+DEPTH = "#5B6B8A"
+
 BASE_FEATURE_COLS = [
-    "Range", "SlopeHigh", "SlopeLow",
-    "Ret_5d", "Ret_20d", "MA_ratio",
-    "Volatility", "RSI", "Vol_ratio",
-]
-OPTIONS_FEATURE_COLS = [
-    "PCR_vol", "PCR_oi", "VOI_call", "VOI_put", "IV_skew_p_minus_c",
+    "Range",
+    "SlopeHigh",
+    "SlopeLow",
+    "Ret_5d",
+    "Ret_20d",
+    "MA_ratio",
+    "Volatility",
+    "RSI",
+    "Vol_ratio",
 ]
 
+st.markdown(
+    f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300&family=Outfit:wght@300;400;500;600&display=swap');
 
-# ─────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────
+.stApp {{ background: {STONE}; }}
+[data-testid="stSidebar"] {{ background: {WHITE}; border-right: 1px solid #DDD8CE; }}
+[data-testid="stSidebar"] * {{ font-family: 'Outfit', sans-serif; }}
+
+h1, h2, h3 {{ font-family: 'Cormorant Garamond', Georgia, serif !important; color: {INK}; }}
+p, span, div, label {{ font-family: 'Outfit', sans-serif; color: {INK}; }}
+
+[data-testid="metric-container"] {{
+    background: {WHITE};
+    border: 1px solid #DDD8CE;
+    border-radius: 14px;
+    padding: 16px 18px;
+}}
+[data-testid="stMetricLabel"] {{
+    font-size: 10px !important;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: {INK_LIGHT} !important;
+}}
+[data-testid="stMetricValue"] {{
+    font-family: 'Cormorant Garamond', serif !important;
+    font-size: 28px !important;
+    color: {INK} !important;
+    font-weight: 400;
+}}
+
+.stTabs [data-baseweb="tab-list"] {{
+    gap: 0;
+    border-bottom: 1px solid #DDD8CE;
+    background: transparent;
+}}
+.stTabs [data-baseweb="tab"] {{
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    font-weight: 600;
+    color: {INK_LIGHT};
+    padding: 10px 22px;
+}}
+.stTabs [aria-selected="true"] {{
+    color: {GOLD} !important;
+    border-bottom: 2px solid {GOLD};
+}}
+
+.stButton > button, .stDownloadButton > button {{
+    font-family: 'Outfit', sans-serif;
+    font-weight: 600;
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    background: linear-gradient(135deg, {GOLD}, #D4B96A);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    padding: 8px 20px;
+}}
+
+[data-testid="stDataFrame"] {{ border-radius: 12px; overflow: hidden; }}
+
+.gold-rule {{
+    height: 1px;
+    background: linear-gradient(90deg, {GOLD}, {GOLD_PALE}, transparent);
+    margin: 12px 0 24px 0;
+}}
+.section-header {{
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    font-weight: 600;
+    color: {GOLD};
+    margin-bottom: 8px;
+}}
+.hero-name {{
+    font-family: 'Cormorant Garamond', Georgia, serif;
+    font-size: 36px;
+    font-weight: 400;
+    color: {INK};
+    letter-spacing: -0.03em;
+    line-height: 1.05;
+}}
+.hero-sub {{
+    font-size: 12px;
+    font-weight: 600;
+    color: {GOLD};
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+}}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# ═══════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+def fmt_pct(v: Optional[float], scale: float = 100.0, digits: int = 2) -> str:
+    if v is None or not np.isfinite(v):
+        return "—"
+    return f"{v * scale:.{digits}f}%"
+
+
+def fmt_num(v: Optional[float], digits: int = 2) -> str:
+    if v is None or not np.isfinite(v):
+        return "—"
+    return f"{v:,.{digits}f}"
+
+
 def to_csv_eu(df: pd.DataFrame, float_format: Optional[str] = None) -> bytes:
     return df.to_csv(
-        index=False, sep=";", decimal=",",
-        date_format="%d.%m.%Y", float_format=float_format,
+        index=False,
+        sep=";",
+        decimal=",",
+        date_format="%d.%m.%Y",
+        float_format=float_format,
     ).encode("utf-8-sig")
 
 
-def _normalize_tickers(items: List[str]) -> List[str]:
-    cleaned = []
+def normalize_tickers(items: List[str]) -> List[str]:
+    cleaned: List[str] = []
     for x in items or []:
-        if not isinstance(x, str):
-            continue
-        s = x.strip().upper()
-        if s:
-            cleaned.append(s)
+        if isinstance(x, str):
+            s = x.strip().upper()
+            if s:
+                cleaned.append(s)
     return list(dict.fromkeys(cleaned))
 
 
@@ -89,300 +205,84 @@ def parse_ticker_csv(path_or_buffer) -> List[str]:
     cols_lower = {c.lower(): c for c in df.columns}
     for key in ("ticker", "symbol", "symbols", "isin", "code"):
         if key in cols_lower:
-            col = cols_lower[key]
-            return _normalize_tickers(df[col].astype(str).tolist())
-    first = df.columns[0]
-    return _normalize_tickers(df[first].astype(str).tolist())
+            return normalize_tickers(df[cols_lower[key]].astype(str).tolist())
+    return normalize_tickers(df.iloc[:, 0].astype(str).tolist())
 
 
-# ─────────────────────────────────────────────────────────────
-# Sidebar – Global Controls
-# ─────────────────────────────────────────────────────────────
-st.sidebar.header("Parameter")
-
-ticker_source = st.sidebar.selectbox(
-    "Ticker-Quelle", ["Manuell (Textfeld)", "CSV-Upload"], index=0
-)
-
-tickers_final: List[str] = []
-if ticker_source == "Manuell (Textfeld)":
-    tickers_input = st.sidebar.text_input(
-        "Tickers (Komma-getrennt)", value="REGN, LULU, VOW3.DE, REI, DDL"
-    )
-    tickers_final = _normalize_tickers(
-        [t for t in tickers_input.split(",") if t.strip()]
-    )
-else:
-    st.sidebar.caption(
-        "Lade eine oder mehrere CSVs mit Spalte **ticker** (oder erste Spalte)."
-    )
-    uploads = st.sidebar.file_uploader(
-        "CSV-Dateien", type=["csv"], accept_multiple_files=True
-    )
-    collected = []
-    if uploads:
-        for up in uploads:
-            try:
-                collected += parse_ticker_csv(up)
-            except Exception as e:
-                st.sidebar.error(f"Fehler beim Lesen von '{up.name}': {e}")
-    base = _normalize_tickers(collected)
-    extra_csv = st.sidebar.text_input(
-        "Weitere Ticker manuell hinzufügen (Komma-getrennt)",
-        value="", key="extra_csv", help="Beispiel: AAPL, TSLA, BABA",
-    )
-    extras = (
-        _normalize_tickers([t for t in extra_csv.split(",") if t.strip()])
-        if extra_csv else []
-    )
-    tickers_final = _normalize_tickers(base + extras)
-    if tickers_final:
-        st.sidebar.caption(f"Gefundene Ticker: {len(tickers_final)}")
-        if st.sidebar.checkbox(
-            "Zufällig mischen", value=False, help="Reihenfolge zufällig (seed=42)"
-        ):
-            import random
-            random.seed(42)
-            random.shuffle(tickers_final)
-        max_n = st.sidebar.number_input(
-            "Max. Anzahl (0 = alle)", min_value=0,
-            max_value=len(tickers_final), value=0, step=10,
-        )
-        if max_n and max_n < len(tickers_final):
-            tickers_final = tickers_final[: int(max_n)]
-        tickers_final = st.sidebar.multiselect(
-            "Auswahl verfeinern", options=tickers_final, default=tickers_final
-        )
-
-if not tickers_final:
-    tickers_final = _normalize_tickers(["REGN", "VOW3.DE", "LULU", "REI", "DDL"])
-
-st.sidebar.download_button(
-    "Kombinierte Ticker als CSV",
-    to_csv_eu(pd.DataFrame({"ticker": tickers_final})),
-    file_name="tickers_combined.csv",
-    mime="text/csv",
-)
-TICKERS = tickers_final
-
-# Core Backtest-Parameter
-START_DATE = st.sidebar.date_input(
-    "Start Date", value=pd.to_datetime("2025-01-01")
-)
-END_DATE = st.sidebar.date_input(
-    "End Date", value=pd.to_datetime(datetime.now(LOCAL_TZ).date())
-)
-LOOKBACK   = st.sidebar.number_input("Lookback (Tage)", 10, 252, 35, step=5)
-HORIZON    = st.sidebar.number_input("Horizon (Tage)", 1, 10, 5)
-THRESH     = st.sidebar.number_input(
-    "Threshold für Target", 0.0, 0.1, 0.046, step=0.005, format="%.3f"
-)
-ENTRY_PROB = st.sidebar.slider("Entry Threshold (P(Signal))", 0.0, 1.0, 0.62, step=0.01)
-EXIT_PROB  = st.sidebar.slider("Exit Threshold (P(Signal))",  0.0, 1.0, 0.48, step=0.01)
-if EXIT_PROB >= ENTRY_PROB:
-    st.sidebar.error("Exit-Threshold muss unter Entry-Threshold liegen.")
-    st.stop()
-
-MIN_HOLD_DAYS = st.sidebar.number_input(
-    "Mindesthaltedauer (Handelstage)", 0, 252, 5, step=1,
-    help="Sperrt Exits, bis die Position mindestens so viele Handelstage gehalten wurde.",
-)
-COOLDOWN_DAYS = st.sidebar.number_input(
-    "Cooling Phase nach Exit (Handelstage)", 0, 252, 0, step=1,
-    help="Verhindert Neueinstiege für X Handelstage nach einem Exit (pro Ticker).",
-)
-
-COMMISSION   = st.sidebar.number_input(
-    "Commission (ad valorem, z.B. 0.001=10bp)",
-    0.0, 0.02, 0.004, step=0.0001, format="%.4f",
-)
-SLIPPAGE_BPS = st.sidebar.number_input(
-    "Slippage (bp je Ausführung)", 0, 50, 5, step=1
-)
-POS_FRAC = st.sidebar.slider(
-    "Positionsgröße (% des Kapitals)", 0.1, 1.0, 1.0, step=0.1
-)
-INIT_CAP = st.sidebar.number_input(
-    "Initial Capital  (€)", min_value=1000.0, value=10_000.0,
-    step=1000.0, format="%.2f",
-)
-
-# Intraday
-use_live          = st.sidebar.checkbox("Letzten Tag intraday aggregieren (falls verfügbar)", value=True)
-intraday_interval = st.sidebar.selectbox(
-    "Intraday-Intervall (Tail & 5-Tage-Chart)", ["1m", "2m", "5m", "15m"], index=2
-)
-fallback_last_session = st.sidebar.checkbox(
-    "Fallback: letzte Session verwenden (wenn heute leer)", value=False
-)
-exec_mode = st.sidebar.selectbox(
-    "Execution Mode", ["Next Open (backtest+live)", "Market-On-Close (live only)"]
-)
-moc_cutoff_min = st.sidebar.number_input(
-    "MOC Cutoff (Minuten vor Close, nur live)", 5, 60, 15, step=5
-)
-intraday_chart_type = st.sidebar.selectbox(
-    "Intraday-Chart", ["Candlestick (OHLC)", "Close-Linie"], index=0
-)
-
-# ── NEU: Modell-Optionen ──────────────────────────────────────
-st.sidebar.markdown("**Modellparameter**")
-USE_WALK_FORWARD = st.sidebar.checkbox(
-    "Walk-Forward (kein Lookahead-Bias)", value=True,
-    help="Empfohlen: Das Modell wird immer nur auf vergangenen Daten trainiert.",
-)
-USE_ENSEMBLE = st.sidebar.checkbox(
-    "Ensemble-Modell (GBM + RF + LR)", value=True,
-    help="Robuster, aber im Walk-Forward-Modus deutlich langsamer.",
-)
-n_estimators  = st.sidebar.number_input("n_estimators",  10, 500, 100, step=10)
-learning_rate = st.sidebar.number_input(
-    "learning_rate", 0.01, 1.0, 0.1, step=0.01, format="%.2f"
-)
-max_depth = st.sidebar.number_input("max_depth", 1, 10, 3, step=1)
-MODEL_PARAMS = dict(
-    n_estimators=int(n_estimators),
-    learning_rate=float(learning_rate),
-    max_depth=int(max_depth),
-    random_state=42,
-)
-
-# ── SPEEDUP: Walk-Forward Stride ─────────────────────────────
-WF_STRIDE = st.sidebar.number_input(
-    "Walk-Forward Stride (Tage)",
-    min_value=1, max_value=30, value=5, step=1,
-    help=(
-        "Modell wird nur alle N Tage neu trainiert statt täglich.\n"
-        "Stride=1  → max. Präzision, sehr langsam.\n"
-        "Stride=5  → ~5× schneller, kaum Qualitätsverlust (empfohlen).\n"
-        "Stride=10 → ~10× schneller, leichter Qualitätsverlust."
-    ),
-)
-
-# ── NEU: Volatilitäts-Positionsgröße ─────────────────────────
-st.sidebar.markdown("**Positionsgröße**")
-USE_VOL_SIZING = st.sidebar.checkbox(
-    "Volatilitäts-Positionsgröße (Kelly-Light)", value=False,
-    help=(
-        "Skaliert die Positionsgröße so, dass die annualisierte Portfolio-Volatilität "
-        "annähernd der Ziel-Vola entspricht. Reduziert automatisch das Exposure "
-        "bei turbulenten Märkten."
-    ),
-)
-TARGET_VOL_ANNUAL = st.sidebar.number_input(
-    "Ziel-Volatilität p.a. (%)", 5.0, 50.0, 15.0, step=1.0,
-    help="Nur aktiv wenn 'Volatilitäts-Positionsgröße' aktiviert.",
-) / 100.0
-
-# Optionsdaten
-st.sidebar.markdown("**Optionsdaten (Einzelaktie)**")
-use_chain_live = st.sidebar.checkbox(
-    "Live-Optionskette je Aktie nutzen (PCR/VOI)", value=True
-)
-atm_band_pct    = st.sidebar.slider("ATM-Band (±%)", 1, 15, 5, step=1) / 100.0
-max_days_to_exp = st.sidebar.slider("Max. Restlaufzeit (Tage)", 7, 45, 21, step=1)
-n_expiries      = st.sidebar.slider("Nächste n Verfälle", 1, 4, 2, step=1)
-
-# Housekeeping
-c1, c2 = st.sidebar.columns(2)
-if c1.button("🔄 Cache leeren"):
-    st.cache_data.clear()
-    st.rerun()
-if c2.button("📥 Summary CSV"):
-    # FIX 3: st.experimental_set_query_params → st.query_params
-    st.query_params["download"] = "summary"
+def cagr_from_equity(equity: pd.Series) -> float:
+    equity = pd.Series(equity).dropna()
+    if len(equity) < 2 or equity.iloc[0] <= 0:
+        return np.nan
+    total_years = max((len(equity) - 1) / TRADING_DAYS, 1 / TRADING_DAYS)
+    return float((equity.iloc[-1] / equity.iloc[0]) ** (1 / total_years) - 1)
 
 
-# ─────────────────────────────────────────────────────────────
-# Misc Helpers
-# ─────────────────────────────────────────────────────────────
-def show_styled_or_plain(df: pd.DataFrame, styler):
-    try:
-        html = getattr(styler, "to_html", None)
-        if callable(html):
-            st.markdown(html(), unsafe_allow_html=True)
-        else:
-            raise AttributeError("Styler ohne to_html()")
-    except Exception as e:
-        st.warning(f"Styled-Tabelle nicht renderbar, fallback auf DataFrame. ({e})")
-        st.dataframe(df, use_container_width=True)
+def max_drawdown_from_equity(equity: pd.Series) -> float:
+    eq = pd.Series(equity).astype(float)
+    peak = eq.cummax()
+    dd = eq / peak - 1.0
+    return float(dd.min()) if len(dd) else np.nan
 
 
-def slope(arr: np.ndarray) -> float:
-    x = np.arange(len(arr))
-    return np.polyfit(x, arr, 1)[0] if len(arr) >= 2 else 0.0
+def sharpe_from_returns(ret: pd.Series) -> float:
+    r = pd.Series(ret).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(r) < 2 or np.isclose(r.std(ddof=0), 0.0):
+        return np.nan
+    return float(np.sqrt(TRADING_DAYS) * r.mean() / r.std(ddof=0))
 
 
-def last_timestamp_info(df: pd.DataFrame, meta: Optional[dict] = None):
-    ts  = df.index[-1]
-    msg = f"Letzter Datenpunkt: {ts.strftime('%Y-%m-%d %H:%M %Z')}"
-    if meta and meta.get("tail_is_intraday") and meta.get("tail_ts") is not None:
-        msg += f" (intraday bis {meta['tail_ts'].strftime('%H:%M %Z')})"
-    st.caption(msg)
+def rolling_slope_vec(series: pd.Series, window: int) -> pd.Series:
+    vals = series.to_numpy(dtype=np.float64)
+    if len(vals) < window:
+        return pd.Series(np.full(len(vals), np.nan), index=series.index)
+    x = np.arange(window, dtype=np.float64)
+    xm = x.mean()
+    denom = ((x - xm) ** 2).sum()
+    weights = (x - xm) / denom
+    wins = sliding_window_view(vals, window_shape=window)
+    ym = wins.mean(axis=1, keepdims=True)
+    slopes = ((wins - ym) * weights).sum(axis=1)
+    out = np.full(len(vals), np.nan, dtype=np.float64)
+    out[window - 1:] = slopes
+    return pd.Series(out, index=series.index)
 
 
-@st.cache_data(show_spinner=False, ttl=24 * 60 * 60)
-def get_ticker_name(ticker: str) -> str:
-    try:
-        tk   = yf.Ticker(ticker)
-        info = {}
-        try:
-            info = tk.get_info()
-        except Exception:
-            info = getattr(tk, "info", {}) or {}
-        for k in ("shortName", "longName", "displayName", "companyName", "name"):
-            if k in info and info[k]:
-                return str(info[k])
-    except Exception:
-        pass
-    return ticker
+def composite_score(sharpe: float, winrate: float, cagr: float, max_dd: float, w_dd: float) -> float:
+    if not (np.isfinite(sharpe) and np.isfinite(winrate) and np.isfinite(cagr) and np.isfinite(max_dd)):
+        return float("-inf")
+    wr_factor = winrate * 2.0
+    cagr_bonus = 1.0 + max(cagr, -1.0)
+    dd_penalty = w_dd * abs(max_dd)
+    return float(sharpe * wr_factor * cagr_bonus - dd_penalty)
 
 
-def style_live_board(df: pd.DataFrame, prob_col: str, entry_threshold: float):
-    def _row_color(row):
-        act = str(row.get("Action_adj", row.get("Action", ""))).lower()
-        if "enter" in act:
-            return ["background-color: #D7F3F7"] * len(row)
-        if "exit" in act:
-            return ["background-color: #FFE8E8"] * len(row)
-        try:
-            if float(row.get(prob_col, np.nan)) >= float(entry_threshold):
-                return ["background-color: #E6F7FF"] * len(row)
-        except Exception:
-            pass
-        return ["background-color: #F7F7F7"] * len(row)
-
-    fmt = {prob_col: "{:.4f}"}
-    if "P_adj"    in df.columns: fmt["P_adj"]    = "{:.4f}"
-    if "Close"    in df.columns: fmt["Close"]    = "{:.2f}"
-    if "Target_5d" in df.columns: fmt["Target_5d"] = "{:.2f}"
-    for c in ["PCR_oi", "PCR_vol", "VOI_call", "VOI_put"]:
-        if c in df.columns: fmt[c] = "{:.4f}"
-
-    sty = df.style.format(fmt).apply(_row_color, axis=1)
-    subset_cols = [c for c in ["Action", "Action_adj"] if c in df.columns]
-    if subset_cols:
-        sty = sty.set_properties(subset=subset_cols, **{"font-weight": "600"})
-    return sty
+def vol_scaled_frac(realized_vol_ann: float, base_frac: float, target_vol_ann: float) -> float:
+    """Single-position volatility scaling; this is NOT portfolio-level vol targeting."""
+    if not np.isfinite(realized_vol_ann) or realized_vol_ann <= 0:
+        return float(base_frac)
+    scaled = base_frac * (target_vol_ann / realized_vol_ann)
+    return float(np.clip(scaled, 0.10 * base_frac, 1.50 * base_frac))
 
 
-# ─────────────────────────────────────────────────────────────
-# Data Loading
-# ─────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False, ttl=120)
+# ═══════════════════════════════════════════════════════════════
+# DATA LOADING
+# ═══════════════════════════════════════════════════════════════
+
+@st.cache_data(show_spinner=False, ttl=180)
 def get_price_data_tail_intraday(
     ticker: str,
-    years: int = 2,
+    years: int = 3,
     use_tail: bool = True,
     interval: str = "5m",
     fallback_last_session: bool = False,
     exec_mode_key: str = "Next Open (backtest+live)",
     moc_cutoff_min_val: int = 15,
-) -> Tuple[pd.DataFrame, dict]:
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     tk = yf.Ticker(ticker)
     df = tk.history(period=f"{years}y", interval="1d", auto_adjust=True, actions=False)
     if df.empty:
         raise ValueError(f"Keine Daten für {ticker}")
+
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC")
     df.index = df.index.tz_convert(LOCAL_TZ)
@@ -390,1940 +290,924 @@ def get_price_data_tail_intraday(
     meta = {"tail_is_intraday": False, "tail_ts": None}
 
     if not use_tail:
-        df.dropna(subset=["High", "Low", "Close", "Open"], inplace=True)
-        return df, meta
+        return df.dropna(subset=["Open", "High", "Low", "Close"]), meta
 
     try:
-        intraday = tk.history(
-            period="1d", interval=interval,
-            auto_adjust=True, actions=False, prepost=False,
-        )
-        if not intraday.empty:
-            if intraday.index.tz is None:
-                intraday.index = intraday.index.tz_localize("UTC")
-            intraday.index = intraday.index.tz_convert(LOCAL_TZ)
-            intraday = intraday.sort_index()
-        else:
-            intraday = pd.DataFrame()
+        intr = tk.history(period="1d", interval=interval, auto_adjust=True, actions=False, prepost=False)
+        if not intr.empty:
+            if intr.index.tz is None:
+                intr.index = intr.index.tz_localize("UTC")
+            intr.index = intr.index.tz_convert(LOCAL_TZ).sort_index()
     except Exception:
-        intraday = pd.DataFrame()
+        intr = pd.DataFrame()
 
-    if exec_mode_key.startswith("Market-On-Close") and not intraday.empty:
-        now_local   = datetime.now(LOCAL_TZ)
-        cutoff_time = now_local - timedelta(minutes=int(moc_cutoff_min_val))
-        intraday    = intraday.loc[:cutoff_time]
+    if exec_mode_key.startswith("Market-On-Close") and not intr.empty:
+        cutoff_time = datetime.now(LOCAL_TZ) - timedelta(minutes=int(moc_cutoff_min_val))
+        intr = intr.loc[:cutoff_time]
 
-    if intraday.empty and fallback_last_session:
+    if intr.empty and fallback_last_session:
         try:
-            intraday5 = tk.history(
-                period="5d", interval=interval,
-                auto_adjust=True, actions=False, prepost=False,
-            )
-            if not intraday5.empty:
-                if intraday5.index.tz is None:
-                    intraday5.index = intraday5.index.tz_localize("UTC")
-                intraday5.index = intraday5.index.tz_convert(LOCAL_TZ)
-                last_session_date = intraday5.index[-1].date()
-                intraday = intraday5.loc[str(last_session_date)]
+            intr5 = tk.history(period="5d", interval=interval, auto_adjust=True, actions=False, prepost=False)
+            if not intr5.empty:
+                if intr5.index.tz is None:
+                    intr5.index = intr5.index.tz_localize("UTC")
+                intr5.index = intr5.index.tz_convert(LOCAL_TZ).sort_index()
+                last_session_date = intr5.index[-1].date()
+                intr = intr5.loc[str(last_session_date)]
         except Exception:
-            pass
+            intr = pd.DataFrame()
 
-    if not intraday.empty:
-        last_bar  = intraday.iloc[-1]
-        day_key   = pd.Timestamp(last_bar.name.date(), tz=LOCAL_TZ)
-        daily_row = {
-            "Open":   float(intraday["Open"].iloc[0]),
-            "High":   float(intraday["High"].max()),
-            "Low":    float(intraday["Low"].min()),
-            "Close":  float(last_bar["Close"]),
-            "Volume": float(intraday["Volume"].sum()),
+    if not intr.empty:
+        last_bar = intr.iloc[-1]
+        day_key = pd.Timestamp(last_bar.name.date(), tz=LOCAL_TZ)
+        df.loc[day_key] = {
+            "Open": float(intr["Open"].iloc[0]),
+            "High": float(intr["High"].max()),
+            "Low": float(intr["Low"].min()),
+            "Close": float(last_bar["Close"]),
+            "Volume": float(intr["Volume"].sum()),
         }
-        df.loc[day_key] = daily_row
         df = df.sort_index()
-        meta["tail_is_intraday"] = True
-        meta["tail_ts"]          = last_bar.name
+        meta = {"tail_is_intraday": True, "tail_ts": last_bar.name}
 
-    df.dropna(subset=["High", "Low", "Close", "Open"], inplace=True)
-    return df, meta
-
-
-@st.cache_data(show_spinner=False, ttl=120)
-def get_intraday_last_n_sessions(
-    ticker: str, sessions: int = 5, days_buffer: int = 10, interval: str = "5m"
-) -> pd.DataFrame:
-    tk   = yf.Ticker(ticker)
-    intr = tk.history(
-        period=f"{days_buffer}d", interval=interval,
-        auto_adjust=True, actions=False, prepost=False,
-    )
-    if intr.empty:
-        return intr
-    if intr.index.tz is None:
-        intr.index = intr.index.tz_localize("UTC")
-    intr.index = intr.index.tz_convert(LOCAL_TZ)
-    intr        = intr.sort_index()
-    unique_dates = pd.Index(intr.index.normalize().unique())
-    keep_dates   = set(unique_dates[-sessions:])
-    mask         = intr.index.normalize().isin(keep_dates)
-    return intr.loc[mask].copy()
+    return df.dropna(subset=["Open", "High", "Low", "Close"]), meta
 
 
 def load_all_prices(
-    tickers: List[str], start: str, end: str,
-    use_tail: bool, interval: str, fallback_last: bool,
-    exec_key: str, moc_cutoff: int,
-) -> Tuple[Dict[str, pd.DataFrame], Dict[str, dict]]:
+    tickers: List[str],
+    start: str,
+    end: str,
+    use_tail: bool,
+    interval: str,
+    fallback_last: bool,
+    exec_key: str,
+    moc_cutoff: int,
+) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Dict[str, Any]]]:
     price_map: Dict[str, pd.DataFrame] = {}
-    meta_map:  Dict[str, dict] = {}
+    meta_map: Dict[str, Dict[str, Any]] = {}
     if not tickers:
         return price_map, meta_map
-    st.info(f"Kurse laden für {len(tickers)} Ticker … (parallel)")
-    prog = st.progress(0.0)
 
-    futures = []
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(tickers))) as ex:
-        for tk in tickers:
-            futures.append(
-                ex.submit(
-                    get_price_data_tail_intraday,
-                    tk, 3, use_tail, interval, fallback_last, exec_key, int(moc_cutoff),
-                )
-            )
-        done = 0
-        for tk, fut in zip(tickers, futures):
+    st.info(f"Kurse laden für {len(tickers)} Ticker …")
+    prog = st.progress(0.0)
+    total = len(tickers)
+    done = 0
+
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, total)) as ex:
+        futures = {
+            ex.submit(
+                get_price_data_tail_intraday,
+                tk,
+                3,
+                use_tail,
+                interval,
+                fallback_last,
+                exec_key,
+                int(moc_cutoff),
+            ): tk
+            for tk in tickers
+        }
+        for fut in as_completed(futures):
+            tk = futures[fut]
             try:
                 df_full, meta = fut.result()
-                df_use        = df_full.loc[str(start):str(end)].copy()
-                price_map[tk] = df_use
-                meta_map[tk]  = meta
+                price_map[tk] = df_full.loc[str(start):str(end)].copy()
+                meta_map[tk] = meta
             except Exception as e:
                 st.error(f"Fehler beim Laden von {tk}: {e}")
             finally:
                 done += 1
-                prog.progress(done / len(tickers))
+                prog.progress(done / total)
     return price_map, meta_map
 
 
-# ─────────────────────────────────────────────────────────────
-# Optionsketten-Aggregation
-# ─────────────────────────────────────────────────────────────
-def _atm_strike(ref_px: float, strikes: np.ndarray) -> float:
-    if not np.isfinite(ref_px) or strikes.size == 0:
-        return np.nan
-    return float(strikes[np.argmin(np.abs(strikes - ref_px))])
+# ═══════════════════════════════════════════════════════════════
+# FEATURES + MODEL
+# ═══════════════════════════════════════════════════════════════
 
-
-def _band_mask(strikes: pd.Series, atm: float, band: float) -> pd.Series:
-    if not np.isfinite(atm):
-        return strikes == False  # noqa: E712
-    lo, hi = atm * (1 - band), atm * (1 + band)
-    return strikes.between(lo, hi)
-
-
-@st.cache_data(show_spinner=False, ttl=180)
-def get_equity_chain_aggregates_for_today(
-    ticker: str,
-    ref_price: float,
-    atm_band: float,
-    n_exps: int,
-    max_days: int,
-) -> pd.DataFrame:
-    tk = yf.Ticker(ticker)
-    try:
-        exps = tk.options or []
-    except Exception:
-        exps = []
-    if not exps:
-        return pd.DataFrame()
-
-    today     = pd.Timestamp.today(tz=LOCAL_TZ).normalize()
-    exps_filt = []
-    for e in exps:
-        try:
-            d = pd.Timestamp(e).tz_localize("UTC").tz_convert(LOCAL_TZ).normalize()
-            if (d - today).days <= max_days:
-                exps_filt.append((d, e))
-        except Exception:
-            pass
-    exps_filt.sort(key=lambda x: x[0])
-    exps_use = [e for _, e in exps_filt[: max(1, n_exps)]]
-    if not exps_use:
-        return pd.DataFrame()
-
-    rows = []
-    for e in exps_use:
-        try:
-            ch            = tk.option_chain(e)
-            calls, puts   = ch.calls.copy(), ch.puts.copy()
-        except Exception:
-            continue
-        for df in (calls, puts):
-            for c in ["volume", "openInterest", "impliedVolatility", "strike"]:
-                if c not in df.columns:
-                    df[c] = np.nan
-
-        strikes = np.sort(
-            pd.concat([calls["strike"], puts["strike"]]).dropna().unique()
-        )
-        atm = _atm_strike(ref_price, strikes)
-        mC  = calls[_band_mask(calls["strike"], atm, atm_band)]
-        mP  = puts [_band_mask(puts ["strike"], atm, atm_band)]
-
-        vC  = float(np.nansum(mC["volume"]))
-        vP  = float(np.nansum(mP["volume"]))
-        oiC = float(np.nansum(mC["openInterest"]))
-        oiP = float(np.nansum(mP["openInterest"]))
-        ivC = float(np.nanmean(mC["impliedVolatility"])) if len(mC) else np.nan
-        ivP = float(np.nanmean(mP["impliedVolatility"])) if len(mP) else np.nan
-
-        rows.append({
-            "exp": e,
-            "vol_c": vC, "vol_p": vP, "oi_c": oiC, "oi_p": oiP,
-            "voi_c": vC / max(oiC, 1.0), "voi_p": vP / max(oiP, 1.0),
-            "iv_c": ivC, "iv_p": ivP,
-        })
-
-    if not rows:
-        return pd.DataFrame()
-    agg = pd.DataFrame(rows).agg({
-        "vol_c": "sum", "vol_p": "sum", "oi_c": "sum", "oi_p": "sum",
-        "voi_c": "mean", "voi_p": "mean", "iv_c": "mean", "iv_p": "mean",
-    })
-    out = pd.DataFrame([{
-        "PCR_vol":          agg["vol_p"] / max(agg["vol_c"], 1.0),
-        "PCR_oi":           agg["oi_p"]  / max(agg["oi_c"],  1.0),
-        "VOI_call":         float(agg["voi_c"]),
-        "VOI_put":          float(agg["voi_p"]),
-        "IV_skew_p_minus_c": float(agg["iv_p"] - agg["iv_c"]),
-        "VOL_tot":          float(agg["vol_c"] + agg["vol_p"]),
-        "OI_tot":           float(agg["oi_c"]  + agg["oi_p"]),
-    }])
-    out.index = [pd.Timestamp.today(tz=LOCAL_TZ).normalize()]
-    return out
-
-
-# ─────────────────────────────────────────────────────────────
-# NEW 1 – Erweiterte Feature-Berechnung
-# ─────────────────────────────────────────────────────────────
-def _rolling_slope_vec(series: pd.Series, window: int) -> pd.Series:
-    """
-    Vektorisierte Rolling-OLS-Slope – bis zu 30× schneller als rolling().apply().
-
-    slope = Σ((x_i - x̄)(y_i - ȳ)) / Σ(x_i - x̄)²
-    Da x = [0,1,...,w-1] fest ist, werden Gewichte einmalig vorberechnet
-    und dann per sliding_window_view auf alle Fenster gleichzeitig angewendet
-    – komplett ohne Python-Loop.
-    """
-    from numpy.lib.stride_tricks import sliding_window_view
-    x     = np.arange(window, dtype=float)
-    xm    = x.mean()
-    denom = ((x - xm) ** 2).sum()
-    if denom == 0:
-        return pd.Series(np.zeros(len(series)), index=series.index)
-    w_vec  = (x - xm) / denom                               # shape (window,)
-    vals   = series.to_numpy(dtype=float)
-    wins   = sliding_window_view(vals, window_shape=window)  # (N-w+1, w)
-    ym     = wins.mean(axis=1, keepdims=True)
-    slopes = ((wins - ym) * w_vec).sum(axis=1)
-    out    = np.full(len(vals), np.nan)
-    out[window - 1:] = slopes
-    return pd.Series(out, index=series.index)
-
-
-def make_features(
-    df: pd.DataFrame,
-    lookback: int,
-    horizon: int,
-    exog: Optional[pd.DataFrame] = None,
-) -> pd.DataFrame:
+def make_features(df: pd.DataFrame, lookback: int, horizon: int) -> pd.DataFrame:
     feat = df.copy()
-
-    # ── Ursprüngliche Features ──────────────────────────────
-    feat["Range"]     = (
-        feat["High"].rolling(lookback).max() - feat["Low"].rolling(lookback).min()
-    )
-    # SPEEDUP: vektorisierte Slope statt rolling().apply() → ~30× schneller
-    feat["SlopeHigh"] = _rolling_slope_vec(feat["High"], lookback)
-    feat["SlopeLow"]  = _rolling_slope_vec(feat["Low"],  lookback)
-
-    # ── NEU: Momentum ────────────────────────────────────────
-    feat["Ret_5d"]   = feat["Close"].pct_change(5)
-    feat["Ret_20d"]  = feat["Close"].pct_change(20)
-    feat["MA_ratio"] = feat["Close"] / (feat["Close"].rolling(20).mean() + 1e-9)
-
-    # ── NEU: Volatilität (realisiert, annualisiert) ──────────
+    feat["Range"] = feat["High"].rolling(lookback).max() - feat["Low"].rolling(lookback).min()
+    feat["SlopeHigh"] = rolling_slope_vec(feat["High"], lookback)
+    feat["SlopeLow"] = rolling_slope_vec(feat["Low"], lookback)
+    feat["Ret_5d"] = feat["Close"].pct_change(5)
+    feat["Ret_20d"] = feat["Close"].pct_change(20)
+    feat["MA_ratio"] = feat["Close"] / feat["Close"].rolling(20).mean()
     feat["Volatility"] = feat["Close"].pct_change().rolling(lookback).std()
 
-    # ── NEU: RSI (14 Perioden) ───────────────────────────────
     delta = feat["Close"].diff()
-    gain  = delta.clip(lower=0).rolling(14).mean()
-    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
     feat["RSI"] = 100.0 - (100.0 / (1.0 + gain / (loss + 1e-9)))
 
-    # ── NEU: Volumen-Ratio ───────────────────────────────────
     if "Volume" in feat.columns and feat["Volume"].gt(0).any():
         vol_ma = feat["Volume"].rolling(20).mean().replace(0, np.nan)
         feat["Vol_ratio"] = feat["Volume"] / vol_ma
     else:
         feat["Vol_ratio"] = 1.0
 
-    feat = feat.iloc[lookback - 1:].copy()
-
-    # ── Exogene Daten (Options) ──────────────────────────────
-    if exog is not None and not exog.empty:
-        feat = feat.join(exog, how="left")
-        # FIX 3: .fillna(method="ffill") → .ffill()
-        feat = feat.ffill()
-
-    feat["FutureRet"] = feat["Close"].shift(-horizon) / feat["Close"] - 1
+    feat = feat.iloc[lookback - 1 :].copy()
+    feat["FutureRet"] = feat["Close"].shift(-horizon) / feat["Close"] - 1.0
     return feat
 
 
-# ─────────────────────────────────────────────────────────────
-# NEW 2 – Ensemble-Modell
-# ─────────────────────────────────────────────────────────────
-def build_ensemble(model_params: dict, use_ensemble: bool):
-    """
-    Gibt ein VotingClassifier-Ensemble (GBM + RF + LR) zurück.
-    Falls use_ensemble=False wird nur der GBM verwendet.
-    """
-    gbm = GradientBoostingClassifier(**model_params)
-    if not use_ensemble:
-        return gbm
+@dataclass
+class TrainedModelBundle:
+    model: HistGradientBoostingClassifier
+    calibrator: Optional[LogisticRegression]
+    x_cols: List[str]
 
-    rf  = RandomForestClassifier(
-        n_estimators=max(50, model_params.get("n_estimators", 100) // 2),
-        max_depth=model_params.get("max_depth", 4),
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        base_p = self.model.predict_proba(X)[:, 1]
+        if self.calibrator is None:
+            return base_p
+        x_cal = np.log(np.clip(base_p, 1e-6, 1 - 1e-6) / np.clip(1 - base_p, 1e-6, 1 - 1e-6)).reshape(-1, 1)
+        return self.calibrator.predict_proba(x_cal)[:, 1]
+
+
+def build_hgb_model(model_params: Dict[str, Any]) -> HistGradientBoostingClassifier:
+    return HistGradientBoostingClassifier(
+        learning_rate=float(model_params["learning_rate"]),
+        max_depth=int(model_params["max_depth"]),
+        max_iter=int(model_params["max_iter"]),
+        min_samples_leaf=int(model_params.get("min_samples_leaf", 20)),
+        l2_regularization=float(model_params.get("l2_regularization", 0.0)),
         random_state=42,
-        n_jobs=-1,
-    )
-    lr = LogisticRegression(C=0.1, max_iter=500, random_state=42)
-
-    return VotingClassifier(
-        estimators=[("gbm", gbm), ("rf", rf), ("lr", lr)],
-        voting="soft",
-        weights=[3, 2, 1],   # GBM erhält höchste Gewichtung
     )
 
 
-def extract_feature_importance(
-    model, x_cols: List[str]
-) -> Optional[pd.Series]:
-    """
-    Extrahiert Feature-Importances aus dem Modell.
-    Bei VotingClassifier wird der GBM-Teilschätzer genutzt.
-    """
-    estimator = model
-    if hasattr(model, "named_estimators_"):
-        estimator = model.named_estimators_.get("gbm", model)
-    if hasattr(estimator, "feature_importances_"):
-        return pd.Series(estimator.feature_importances_, index=x_cols)
-    if hasattr(estimator, "coef_"):
-        return pd.Series(np.abs(estimator.coef_[0]), index=x_cols)
-    return None
+def fit_model_with_calibration(
+    X: np.ndarray,
+    y: np.ndarray,
+    model_params: Dict[str, Any],
+    use_calibration: bool,
+    calibration_frac: float,
+) -> Optional[TrainedModelBundle]:
+    if len(X) < 40 or len(np.unique(y)) < 2:
+        return None
+
+    if not use_calibration or len(X) < 80:
+        model = build_hgb_model(model_params)
+        model.fit(X, y)
+        return TrainedModelBundle(model=model, calibrator=None, x_cols=BASE_FEATURE_COLS)
+
+    split = int(len(X) * (1.0 - calibration_frac))
+    split = max(30, min(split, len(X) - 20))
+    X_fit, y_fit = X[:split], y[:split]
+    X_calib, y_calib = X[split:], y[split:]
+
+    if len(np.unique(y_fit)) < 2 or len(np.unique(y_calib)) < 2:
+        model = build_hgb_model(model_params)
+        model.fit(X, y)
+        return TrainedModelBundle(model=model, calibrator=None, x_cols=BASE_FEATURE_COLS)
+
+    model = build_hgb_model(model_params)
+    model.fit(X_fit, y_fit)
+
+    p_cal = model.predict_proba(X_calib)[:, 1]
+    x_platt = np.log(np.clip(p_cal, 1e-6, 1 - 1e-6) / np.clip(1 - p_cal, 1e-6, 1 - 1e-6)).reshape(-1, 1)
+    calibrator = LogisticRegression(max_iter=1000, random_state=42)
+    calibrator.fit(x_platt, y_calib)
+    return TrainedModelBundle(model=model, calibrator=calibrator, x_cols=BASE_FEATURE_COLS)
 
 
-# ─────────────────────────────────────────────────────────────
-# Features, Training & Backtest (Walk-Forward)
-# ─────────────────────────────────────────────────────────────
-def make_features_and_train(
+# ═══════════════════════════════════════════════════════════════
+# BACKTEST ENGINE
+# ═══════════════════════════════════════════════════════════════
+
+def make_features_and_backtest(
     df: pd.DataFrame,
     lookback: int,
     horizon: int,
     threshold: float,
-    model_params: dict,
+    model_params: Dict[str, Any],
     entry_prob: float,
     exit_prob: float,
     min_hold_days: int = 0,
     cooldown_days: int = 0,
-    exog_df: Optional[pd.DataFrame] = None,
-    walk_forward: bool = True,         # FIX 2: jetzt True als Standard
-    use_ensemble: bool = True,         # NEW 2
-    use_vol_sizing: bool = False,      # NEW 3
-    target_vol_annual: float = 0.15,   # NEW 3
-    wf_stride: int = 5,               # SPEEDUP: Retrain nur alle N Bars
-) -> Tuple[pd.DataFrame, pd.DataFrame, List[dict], dict]:
-
-    feat = make_features(df, lookback, horizon, exog=exog_df)
-
-    hist = feat.iloc[:-1].dropna(subset=["FutureRet"]).copy()
-    if len(hist) < 30:
-        raise ValueError("Zu wenige Datenpunkte nach Preprocessing für das Modell.")
-
-    # FIX 1: Dynamische X_cols – Options-Features einbeziehen wenn vorhanden
-    x_cols = BASE_FEATURE_COLS + [
-        c for c in OPTIONS_FEATURE_COLS
-        if c in hist.columns and hist[c].notna().sum() >= 10
-    ]
-    # Nur vorhandene Spalten verwenden
-    x_cols = [c for c in x_cols if c in hist.columns]
-
-    last_fi: Optional[pd.Series] = None  # Feature-Importance des letzten Modells
-
-    if not walk_forward:
-        # Volltraining – KEIN Walk-Forward (Lookahead-Bias möglich!)
-        hist["Target"] = (hist["FutureRet"] > threshold).astype(int)
-        if hist["Target"].nunique() < 2:
-            feat["SignalProb"] = 0.5
-        else:
-            X_train = hist[x_cols].fillna(0).values
-            scaler  = StandardScaler().fit(X_train)
-            model   = build_ensemble(model_params, use_ensemble)
-            model.fit(scaler.transform(X_train), hist["Target"].values)
-            feat["SignalProb"] = model.predict_proba(
-                scaler.transform(feat[x_cols].fillna(0).values)
-            )[:, 1]
-            last_fi = extract_feature_importance(model, x_cols)
-    else:
-        # SPEEDUP: Walk-Forward mit konfigurierbarem Stride
-        # Das Modell wird nur alle wf_stride Bars neu trainiert;
-        # dazwischenliegende Bars erhalten dieselbe Wahrscheinlichkeit
-        # (ffill). Bei Stride=5 → ~5× schneller, kaum Qualitätsverlust.
-        probs     = np.full(len(feat), np.nan, dtype=float)
-        min_train = max(lookback + horizon + 5, 40)
-        model     = None   # wird in erstem Fit gesetzt
-
-        # Retrain-Zeitpunkte: nur jeden wf_stride-ten Bar
-        retrain_steps = list(range(min_train, len(feat), int(wf_stride)))
-        # Prediction-Zeitpunkte: alle Bars ab min_train
-        predict_steps = list(range(min_train, len(feat)))
-
-        # Cache für aktuellen Scaler/Modell
-        _scaler_cache: Optional[StandardScaler] = None
-        _model_cache                             = None
-
-        for t in predict_steps:
-            should_retrain = (t in set(retrain_steps)) or (_model_cache is None)
-            if should_retrain:
-                train = feat.iloc[:t].dropna(subset=["FutureRet"]).copy()
-                if len(train) < min_train:
-                    continue
-                train["Target"] = (train["FutureRet"] > threshold).astype(int)
-                if train["Target"].nunique() < 2:
-                    continue
-                X_train        = train[x_cols].fillna(0).values
-                _scaler_cache  = StandardScaler().fit(X_train)
-                _model_cache   = build_ensemble(model_params, use_ensemble)
-                _model_cache.fit(
-                    _scaler_cache.transform(X_train), train["Target"].values
-                )
-                model = _model_cache   # für Feature-Importance
-
-            if _scaler_cache is None or _model_cache is None:
-                continue
-            probs[t] = _model_cache.predict_proba(
-                _scaler_cache.transform(feat[x_cols].iloc[[t]].fillna(0).values)
-            )[0, 1]
-
-        feat["SignalProb"] = (
-            pd.Series(probs, index=feat.index).ffill().fillna(0.5)
-        )
-        # Feature-Importance des letzten trainierten Modells
-        last_fi = extract_feature_importance(model, x_cols) if model else None
-
-    feat_bt = feat.iloc[:-1].copy()
-    df_bt, trades = backtest_next_open(
-        feat_bt, entry_prob, exit_prob,
-        COMMISSION, SLIPPAGE_BPS, INIT_CAP, POS_FRAC,
-        min_hold_days=int(min_hold_days),
-        cooldown_days=int(cooldown_days),
-        use_vol_sizing=use_vol_sizing,
-        target_vol_annual=target_vol_annual,
-    )
-    metrics = compute_performance(df_bt, trades, INIT_CAP)
-    # Feature-Importance in metrics-Dict einbetten
-    metrics["_feature_importance"] = last_fi
-    metrics["_x_cols"]             = x_cols
-    return feat, df_bt, trades, metrics
-
-
-# ─────────────────────────────────────────────────────────────
-# Backtest  (NEW 3: Volatilitäts-Positionsgröße, FIX 4: Cooldown)
-# ─────────────────────────────────────────────────────────────
-def _vol_scaled_frac(
-    vol_daily: float,
-    pos_frac: float,
-    target_vol_annual: float,
-) -> float:
-    """
-    Skaliert die Positionsgröße (Kelly-Light):
-    Zielt darauf ab, dass jede Position ~target_vol_annual Vola beisteuert.
-    """
-    if not np.isfinite(vol_daily) or vol_daily <= 1e-8:
-        return pos_frac * 0.5
-    vol_annual = vol_daily * sqrt(252)
-    raw_frac   = target_vol_annual / max(vol_annual, 1e-6)
-    return min(raw_frac * pos_frac, pos_frac)
-
-
-def backtest_next_open(
-    df: pd.DataFrame,
-    entry_thr: float,
-    exit_thr: float,
-    commission: float,
-    slippage_bps: int,
-    init_cap: float,
-    pos_frac: float,
-    min_hold_days: int = 0,
-    cooldown_days: int = 0,
+    walk_forward: bool = True,
     use_vol_sizing: bool = False,
     target_vol_annual: float = 0.15,
-) -> Tuple[pd.DataFrame, List[dict]]:
-    df = df.copy()
-    n  = len(df)
-    if n < 2:
-        raise ValueError("Zu wenige Datenpunkte für Backtest.")
+    base_pos_frac: float = 1.0,
+    commission: float = 0.0,
+    slippage_bps: float = 0.0,
+    init_cap: float = 10_000.0,
+    wf_stride: int = 5,
+    use_calibration: bool = True,
+    calibration_frac: float = 0.20,
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[dict], dict]:
+    feat = make_features(df, lookback, horizon)
+    hist = feat.iloc[:-1].dropna(subset=["FutureRet"]).copy()
+    if len(hist) < 60:
+        raise ValueError("Zu wenige Datenpunkte nach Preprocessing für das Modell.")
 
-    cash_gross = init_cap
-    cash_net   = init_cap
-    shares     = 0.0
-    in_pos     = False
+    x_cols = [c for c in BASE_FEATURE_COLS if c in hist.columns]
+    X_all = feat[x_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy(dtype=np.float32)
+    future_ret = feat["FutureRet"].to_numpy(dtype=np.float32)
+    probs = np.full(len(feat), np.nan, dtype=np.float32)
 
-    cost_basis_gross = 0.0
-    cost_basis_net   = 0.0
-
-    last_entry_idx: Optional[int] = None
-    last_exit_idx:  Optional[int] = None
-
-    equity_gross, equity_net, trades = [], [], []
-    cum_pl_net = 0.0
-
-    for i in range(n):
-        if i > 0:
-            open_today = float(df["Open"].iloc[i])
-            slip_buy   = open_today * (1 + slippage_bps / 10_000.0)
-            slip_sell  = open_today * (1 - slippage_bps / 10_000.0)
-            prob_prev  = float(df["SignalProb"].iloc[i - 1])
-            date_exec  = df.index[i]
-
-            # FIX 4: Cooldown Off-by-One → > statt >=
-            cool_ok = True
-            if (not in_pos) and cooldown_days > 0 and last_exit_idx is not None:
-                bars_since_exit = i - last_exit_idx
-                cool_ok = bars_since_exit > int(cooldown_days)
-
-            # ── ENTRY ──────────────────────────────────────────
-            can_enter = (not in_pos) and (prob_prev > entry_thr) and cool_ok
-            if can_enter:
-                # NEW 3: Positionsgröße bestimmen
-                if use_vol_sizing and "Volatility" in df.columns:
-                    vol_d      = float(df["Volatility"].iloc[i - 1])
-                    eff_frac   = _vol_scaled_frac(vol_d, pos_frac, target_vol_annual)
+    if not walk_forward:
+        train_mask = np.isfinite(future_ret)
+        X_train = X_all[train_mask]
+        y_train = (future_ret[train_mask] > threshold).astype(np.int8)
+        bundle = fit_model_with_calibration(X_train, y_train, model_params, use_calibration, calibration_frac)
+        if bundle is None:
+            probs[:] = 0.5
+        else:
+            probs[:] = bundle.predict_proba(X_all).astype(np.float32)
+    else:
+        min_train = max(lookback + horizon + 20, 80)
+        t = min_train
+        while t < len(feat):
+            train_end = t
+            train_mask = np.isfinite(future_ret[:train_end])
+            if train_mask.sum() >= min_train:
+                X_train = X_all[:train_end][train_mask]
+                y_train = (future_ret[:train_end][train_mask] > threshold).astype(np.int8)
+                bundle = fit_model_with_calibration(X_train, y_train, model_params, use_calibration, calibration_frac)
+                pred_end = min(t + int(wf_stride), len(feat))
+                if bundle is None:
+                    probs[t:pred_end] = 0.5
                 else:
-                    eff_frac   = pos_frac
+                    probs[t:pred_end] = bundle.predict_proba(X_all[t:pred_end]).astype(np.float32)
+            t += int(wf_stride)
+        probs[:min_train] = np.nan
+        probs = pd.Series(probs, index=feat.index).ffill().fillna(0.5).to_numpy(dtype=np.float32)
 
-                invest_net    = cash_net * eff_frac
-                fee_entry     = invest_net * commission
-                target_shares = max((invest_net - fee_entry) / slip_buy, 0.0)
+    feat["SignalProb"] = probs
 
-                if (
-                    target_shares > 0
-                    and (target_shares * slip_buy + fee_entry) <= cash_net + 1e-9
-                ):
-                    shares           = target_shares
-                    cost_basis_gross = shares * slip_buy
-                    cost_basis_net   = shares * slip_buy + fee_entry
-                    cash_gross      -= cost_basis_gross
-                    cash_net        -= cost_basis_net
-                    in_pos           = True
-                    last_entry_idx   = i
-                    trades.append({
-                        "Date":     date_exec,
-                        "Typ":      "Entry",
-                        "Price":    round(slip_buy, 4),
-                        "Shares":   round(shares, 4),
-                        "Gross P&L": 0.0,
-                        "Fees":     round(fee_entry, 2),
-                        "Net P&L":  0.0,
-                        "kum P&L":  round(cum_pl_net, 2),
-                        "Prob":     round(prob_prev, 4),
-                        "HoldDays": np.nan,
-                        "PosFrac":  round(eff_frac, 4),
-                    })
+    bt = feat[["Open", "High", "Low", "Close", "SignalProb", "Volatility"]].copy()
+    bt["MarketRet"] = bt["Close"].pct_change().fillna(0.0)
+    bt["Target_5d"] = feat["FutureRet"]
 
-            # ── EXIT ───────────────────────────────────────────
-            elif in_pos and prob_prev < exit_thr:
-                held_bars = (i - last_entry_idx) if last_entry_idx is not None else 0
-                if int(min_hold_days) > 0 and held_bars < int(min_hold_days):
-                    pass   # Mindesthaltedauer noch nicht erreicht
-                else:
-                    gross_value = shares * slip_sell
-                    fee_exit    = gross_value * commission
-                    pnl_gross   = gross_value - cost_basis_gross
-                    pnl_net     = (gross_value - fee_exit) - cost_basis_net
+    position = 0
+    shares = 0.0
+    cash = float(init_cap)
+    last_exit_idx = -10_000
+    hold_days = 0
+    trades: List[dict] = []
+    pending_entry = False
+    pending_exit = False
+    entry_px = np.nan
+    entry_dt = None
+    pos_frac_t = float(base_pos_frac)
 
-                    cash_gross += gross_value
-                    cash_net   += (gross_value - fee_exit)
+    equity_gross = []
+    equity_net = []
+    pos_list = []
+    act_list = []
+    action_adj_list = []
 
-                    in_pos           = False
-                    shares           = 0.0
-                    cost_basis_gross = 0.0
-                    cost_basis_net   = 0.0
-                    cum_pl_net      += pnl_net
+    slip = float(slippage_bps) / 10_000.0
 
-                    trades.append({
-                        "Date":      date_exec,
-                        "Typ":       "Exit",
-                        "Price":     round(slip_sell, 4),
-                        "Shares":    0.0,
-                        "Gross P&L": round(pnl_gross, 2),
-                        "Fees":      round(fee_exit, 2),
-                        "Net P&L":   round(pnl_net, 2),
-                        "kum P&L":   round(cum_pl_net, 2),
-                        "Prob":      round(prob_prev, 4),
-                        "HoldDays":  int(held_bars),
-                        "PosFrac":   np.nan,
-                    })
-                    last_exit_idx  = i
-                    last_entry_idx = None
+    for i in range(len(bt)):
+        row = bt.iloc[i]
+        open_px = float(row["Open"])
+        close_px = float(row["Close"])
+        prob = float(row["SignalProb"])
+        realized_vol_ann = float(row["Volatility"] * np.sqrt(TRADING_DAYS)) if np.isfinite(row["Volatility"]) else np.nan
 
-        close_today = float(df["Close"].iloc[i])
-        equity_gross.append(cash_gross + (shares * close_today if in_pos else 0.0))
-        equity_net.append(cash_net   + (shares * close_today if in_pos else 0.0))
+        action = "Hold"
+        action_adj = "Hold"
 
-    df_bt                = df.copy()
-    df_bt["Equity_Gross"] = equity_gross
-    df_bt["Equity_Net"]   = equity_net
-    return df_bt, trades
+        if pending_exit and position == 1:
+            exec_px = open_px * (1.0 - slip)
+            proceeds = shares * exec_px
+            fee = proceeds * commission
+            cash += proceeds - fee
+            pnl_pct = (exec_px / entry_px - 1.0) if entry_px > 0 else np.nan
+            trades.append(
+                {
+                    "Typ": "Exit",
+                    "Date": bt.index[i],
+                    "Price": exec_px,
+                    "PnL_%": pnl_pct * 100.0 if np.isfinite(pnl_pct) else np.nan,
+                    "Held_Days": hold_days,
+                    "Probability": prob,
+                }
+            )
+            shares = 0.0
+            position = 0
+            last_exit_idx = i
+            hold_days = 0
+            pending_exit = False
+            action_adj = "Exit @ Next Open"
+
+        if pending_entry and position == 0:
+            if i - last_exit_idx > cooldown_days:
+                pos_frac_t = float(base_pos_frac)
+                if use_vol_sizing:
+                    pos_frac_t = vol_scaled_frac(realized_vol_ann, float(base_pos_frac), float(target_vol_annual))
+                exec_px = open_px * (1.0 + slip)
+                alloc = cash * pos_frac_t
+                fee = alloc * commission
+                effective_alloc = max(alloc - fee, 0.0)
+                shares = effective_alloc / exec_px if exec_px > 0 else 0.0
+                cash -= alloc
+                entry_px = exec_px
+                entry_dt = bt.index[i]
+                position = 1
+                hold_days = 0
+                trades.append(
+                    {
+                        "Typ": "Entry",
+                        "Date": bt.index[i],
+                        "Price": exec_px,
+                        "PnL_%": np.nan,
+                        "Held_Days": 0,
+                        "Probability": prob,
+                        "PosFrac": pos_frac_t,
+                    }
+                )
+                action_adj = "Enter @ Next Open"
+            pending_entry = False
+
+        if position == 1:
+            hold_days += 1
+            if prob <= exit_prob and hold_days >= min_hold_days:
+                pending_exit = True
+                action = "Exit"
+            else:
+                action = "Hold Long"
+        else:
+            can_enter = (i - last_exit_idx) > cooldown_days
+            if prob >= entry_prob and can_enter:
+                pending_entry = True
+                action = "Enter"
+            else:
+                action = "Hold Cash"
+
+        gross_eq = cash + shares * close_px
+        net_eq = gross_eq
+        equity_gross.append(gross_eq)
+        equity_net.append(net_eq)
+        pos_list.append(position)
+        act_list.append(action)
+        action_adj_list.append(action_adj)
+
+    bt["Position"] = pos_list
+    bt["Action"] = act_list
+    bt["Action_adj"] = action_adj_list
+    bt["Equity_Gross"] = np.array(equity_gross, dtype=np.float64)
+    bt["Equity_Net"] = np.array(equity_net, dtype=np.float64)
+    bt["StrategyRet"] = bt["Equity_Net"].pct_change().fillna(0.0)
+
+    trades_df = pd.DataFrame(trades)
+
+    bh_ret = bt["Close"].iloc[-1] / bt["Close"].iloc[0] - 1.0
+    net_ret = bt["Equity_Net"].iloc[-1] / bt["Equity_Net"].iloc[0] - 1.0
+    max_dd = max_drawdown_from_equity(bt["Equity_Net"])
+    cagr = cagr_from_equity(bt["Equity_Net"])
+    sharpe = sharpe_from_returns(bt["StrategyRet"])
+
+    closed_trades = trades_df[trades_df["Typ"] == "Exit"].copy()
+    winrate = float((closed_trades["PnL_%"] > 0).mean()) if len(closed_trades) else np.nan
+
+    summary = {
+        "Net (%)": net_ret * 100.0,
+        "CAGR (%)": cagr * 100.0 if np.isfinite(cagr) else np.nan,
+        "Sharpe": sharpe,
+        "Max DD (%)": max_dd * 100.0 if np.isfinite(max_dd) else np.nan,
+        "Buy & Hold (%)": bh_ret * 100.0,
+        "Closed Trades": int(len(closed_trades)),
+        "Win Rate (%)": winrate * 100.0 if np.isfinite(winrate) else np.nan,
+        "Last Signal Probability": float(bt["SignalProb"].iloc[-1]),
+        "Next Action": bt["Action"].iloc[-1],
+    }
+    return feat, bt, trades, summary
 
 
-# ─────────────────────────────────────────────────────────────
-# Performance-Kennzahlen
-# ─────────────────────────────────────────────────────────────
-def _cagr_from_path(values: pd.Series) -> float:
-    if len(values) < 2:
-        return np.nan
-    years = len(values) / 252.0
-    if years <= 0:
-        return np.nan
-    v0, v1 = float(values.iloc[0]), float(values.iloc[-1])
-    if v0 <= 0 or not np.isfinite(v0) or not np.isfinite(v1):
-        return np.nan
-    return (v1 / v0) ** (1.0 / years) - 1.0
+# ═══════════════════════════════════════════════════════════════
+# OPTIMIZER — TWO STAGE RANDOM SEARCH
+# ═══════════════════════════════════════════════════════════════
 
-
-def _sortino(rets: pd.Series) -> float:
-    if rets.empty:
-        return np.nan
-    mean     = rets.mean() * 252
-    downside = rets[rets < 0]
-    dd       = downside.std() * sqrt(252) if len(downside) else np.nan
-    return mean / dd if dd and np.isfinite(dd) and dd > 0 else np.nan
-
-
-def _winrate_roundtrips(trades: List[dict]) -> float:
-    if not trades:
-        return np.nan
-    pnl   = []
-    entry = None
-    for ev in trades:
-        if ev["Typ"] == "Entry":
-            entry = ev
-        elif ev["Typ"] == "Exit" and entry is not None:
-            pnl.append(float(ev.get("Net P&L", 0.0)))
-            entry = None
-    if not pnl:
-        return np.nan
-    pnl = np.array(pnl, dtype=float)
-    return float((pnl > 0).mean())
-
-
-def compute_performance(
-    df_bt: pd.DataFrame, trades: List[dict], init_cap: float
-) -> dict:
-    net_ret  = (df_bt["Equity_Net"].iloc[-1] / init_cap - 1) * 100
-    rets     = df_bt["Equity_Net"].pct_change().dropna()
-    vol_ann  = rets.std() * sqrt(252) * 100
-    sharpe   = (rets.mean() * sqrt(252)) / (rets.std() + 1e-12)
-    dd       = (
-        (df_bt["Equity_Net"] - df_bt["Equity_Net"].cummax())
-        / df_bt["Equity_Net"].cummax()
-    )
-    max_dd   = dd.min() * 100
-    calmar   = (net_ret / 100) / abs(max_dd / 100) if max_dd < 0 else np.nan
-    gross_ret = (df_bt["Equity_Gross"].iloc[-1] / init_cap - 1) * 100
-    bh_ret   = (df_bt["Close"].iloc[-1] / df_bt["Close"].iloc[0] - 1) * 100
-    fees     = sum(t["Fees"] for t in trades)
-    phase    = "Open" if trades and trades[-1]["Typ"] == "Entry" else "Flat"
-    completed = sum(1 for t in trades if t["Typ"] == "Exit")
-    net_eur  = df_bt["Equity_Net"].iloc[-1] - init_cap
-    cagr     = _cagr_from_path(df_bt["Equity_Net"])
-    sortino  = _sortino(rets)
-    winrate  = _winrate_roundtrips(trades)
-
+def sample_params(rng: random.Random) -> Dict[str, Any]:
     return {
-        "Strategy Net (%)":   round(net_ret, 2),
-        "Strategy Gross (%)": round(gross_ret, 2),
-        "Buy & Hold Net (%)": round(bh_ret, 2),
-        "Volatility (%)":     round(vol_ann, 2),
-        "Sharpe-Ratio":       round(sharpe, 2),
-        "Sortino-Ratio":      round(sortino, 2) if np.isfinite(sortino) else np.nan,
-        "Max Drawdown (%)":   round(max_dd, 2),
-        "Calmar-Ratio":       round(calmar, 2) if np.isfinite(calmar) else np.nan,
-        "Fees (€)":           round(fees, 2),
-        "Phase":              phase,
-        "Number of Trades":   completed,
-        "Net P&L (€)":        round(net_eur, 2),
-        "CAGR (%)":           round(100 * (cagr if np.isfinite(cagr) else np.nan), 2),
-        "Winrate (%)":        round(100 * (winrate if np.isfinite(winrate) else np.nan), 2),
+        "lookback": rng.choice([20, 25, 30, 35, 40, 50, 60]),
+        "horizon": rng.choice([3, 4, 5, 7, 10]),
+        "threshold": round(rng.uniform(0.01, 0.08), 3),
+        "entry_prob": round(rng.uniform(0.55, 0.72), 2),
+        "exit_prob": round(rng.uniform(0.35, 0.54), 2),
+        "max_iter": rng.choice([80, 100, 120, 150, 180, 220]),
+        "learning_rate": round(rng.uniform(0.03, 0.15), 3),
+        "max_depth": rng.choice([2, 3, 4, 5, 6]),
+        "min_samples_leaf": rng.choice([10, 15, 20, 25, 30]),
+        "l2_regularization": round(rng.uniform(0.0, 1.5), 2),
+        "wf_stride": rng.choice([3, 5, 7, 10]),
     }
 
 
-def compute_round_trips(all_trades: Dict[str, List[dict]]) -> pd.DataFrame:
-    rows = []
-    for tk, tr in all_trades.items():
-        name          = get_ticker_name(tk)
-        current_entry = None
-        for ev in tr:
-            if ev["Typ"] == "Entry":
-                current_entry = ev
-            elif ev["Typ"] == "Exit" and current_entry is not None:
-                entry_date = pd.to_datetime(current_entry["Date"])
-                exit_date  = pd.to_datetime(ev["Date"])
-                hold_days  = (exit_date - entry_date).days
-                shares     = float(current_entry.get("Shares", 0.0))
-                entry_p    = float(current_entry.get("Price", np.nan))
-                exit_p     = float(ev.get("Price", np.nan))
-                fee_e      = float(current_entry.get("Fees", 0.0))
-                fee_x      = float(ev.get("Fees", 0.0))
-                pnl_net    = float(ev.get("Net P&L", 0.0))
-                cost_net   = shares * entry_p + fee_e
-                ret_pct    = (pnl_net / cost_net * 100.0) if cost_net else np.nan
-                rows.append({
-                    "Ticker":       tk,
-                    "Name":         name,
-                    "Entry Date":   entry_date,
-                    "Exit Date":    exit_date,
-                    "Hold (days)":  hold_days,
-                    "Entry Prob":   current_entry.get("Prob", np.nan),
-                    "Exit Prob":    ev.get("Prob", np.nan),
-                    "PosFrac":      current_entry.get("PosFrac", np.nan),
-                    "Shares":       round(shares, 4),
-                    "Entry Price":  round(entry_p, 4),
-                    "Exit Price":   round(exit_p, 4),
-                    "PnL Net (€)":  round(pnl_net, 2),
-                    "Fees (€)":     round(fee_e + fee_x, 2),
-                    "Return (%)":   round(ret_pct, 2),
-                })
-                current_entry = None
-    return pd.DataFrame(rows)
+def jitter_params(base: Dict[str, Any], rng: random.Random) -> Dict[str, Any]:
+    p = dict(base)
+    p["lookback"] = int(np.clip(base["lookback"] + rng.choice([-10, -5, 0, 5, 10]), 15, 80))
+    p["horizon"] = int(np.clip(base["horizon"] + rng.choice([-2, -1, 0, 1, 2]), 2, 12))
+    p["threshold"] = round(float(np.clip(base["threshold"] + rng.uniform(-0.01, 0.01), 0.0, 0.10)), 3)
+    p["entry_prob"] = round(float(np.clip(base["entry_prob"] + rng.uniform(-0.04, 0.04), 0.50, 0.80)), 2)
+    p["exit_prob"] = round(float(np.clip(base["exit_prob"] + rng.uniform(-0.04, 0.04), 0.20, 0.65)), 2)
+    if p["exit_prob"] >= p["entry_prob"]:
+        p["exit_prob"] = round(max(0.20, p["entry_prob"] - 0.05), 2)
+    p["max_iter"] = int(np.clip(base["max_iter"] + rng.choice([-40, -20, 0, 20, 40]), 60, 260))
+    p["learning_rate"] = round(float(np.clip(base["learning_rate"] + rng.uniform(-0.03, 0.03), 0.02, 0.20)), 3)
+    p["max_depth"] = int(np.clip(base["max_depth"] + rng.choice([-1, 0, 1]), 2, 7))
+    p["min_samples_leaf"] = int(np.clip(base["min_samples_leaf"] + rng.choice([-10, -5, 0, 5, 10]), 5, 40))
+    p["l2_regularization"] = round(float(np.clip(base["l2_regularization"] + rng.uniform(-0.4, 0.4), 0.0, 2.5)), 2)
+    p["wf_stride"] = int(np.clip(base["wf_stride"] + rng.choice([-2, 0, 2]), 2, 12))
+    return p
 
 
-# ─────────────────────────────────────────────────────────────
-# NEW 4 – Feature-Importance-Chart
-# ─────────────────────────────────────────────────────────────
-def show_feature_importance(fi: Optional[pd.Series], x_cols: List[str]) -> None:
-    if fi is None or fi.empty:
-        st.caption("Feature-Importance nicht verfügbar (LR-Fallback oder zu wenig Daten).")
-        return
-    fi_sorted = fi.sort_values(ascending=True)
-    colors    = [
-        "#EF4444" if c in OPTIONS_FEATURE_COLS else "#6366F1"
-        for c in fi_sorted.index
-    ]
-    fig = go.Figure(
-        go.Bar(
-            x=fi_sorted.values,
-            y=fi_sorted.index,
-            orientation="h",
-            marker_color=colors,
-            hovertemplate="%{y}: %{x:.4f}<extra></extra>",
-        )
-    )
-    fig.update_layout(
-        title="Feature Importance (GBM-Teilmodell) – Rot = Options-Feature",
-        xaxis_title="Importance",
-        height=max(300, len(fi_sorted) * 28),
-        margin=dict(t=45, l=160, r=20, b=35),
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-    )
-    st.plotly_chart(fig, use_container_width=True)
+def evaluate_param_set(
+    params: Dict[str, Any],
+    price_map: Dict[str, pd.DataFrame],
+    tickers: List[str],
+    base_settings: Dict[str, Any],
+    w_dd: float,
+    stage_name: str,
+) -> Dict[str, Any]:
+    scores: List[float] = []
+    diagnostics: List[Dict[str, Any]] = []
 
+    for tk in tickers:
+        df = price_map.get(tk)
+        if df is None or len(df) < 150:
+            continue
 
-# ─────────────────────────────────────────────────────────────
-# 🧭 Parameter-Optimierung
-# ─────────────────────────────────────────────────────────────
-# Score-Funktion (trade-count-unabhängig):
-#   Score = Sharpe × Winrate × (1 + CAGR_norm) − w_dd × |MaxDD|
-#   Alle Komponenten werden als Median über Walk-Forward-Hälften
-#   und alle Ticker aggregiert → robust gegen Einzelausreißer.
-# ─────────────────────────────────────────────────────────────
-
-def _composite_score(
-    sharpe:   float,
-    winrate:  float,   # 0–1
-    cagr:     float,   # z.B. 0.12 für 12%
-    max_dd:   float,   # negativ, z.B. -0.18 für 18% DD
-    w_dd:     float,   # Gewicht für DD-Abzug (Sidebar)
-) -> float:
-    """
-    Kombinierter Score ohne jegliche Trade-Count-Bedingung.
-
-    Logik:
-      - Sharpe:  Kern-Metrik (risikoadjustierte Rendite)
-      - Winrate: Multiplikator – filtert Glücks-Strategien
-                 (1 großer Win, viele Verluste)
-      - CAGR:   Bonus für tatsächliches Kapitalwachstum,
-                normiert auf [-1, +∞) damit 0% CAGR neutral ist
-      - MaxDD:  Direkter Abzug – hohe Drawdowns werden
-                unabhängig vom Sharpe bestraft
-    """
-    if not (np.isfinite(sharpe) and np.isfinite(winrate)
-            and np.isfinite(cagr) and np.isfinite(max_dd)):
-        return float("-inf")
-    # winrate als Faktor: 0.5 = neutral, >0.5 = Bonus, <0.5 = Malus
-    wr_factor   = winrate * 2.0          # 0→0, 0.5→1.0, 1→2.0
-    cagr_bonus  = 1.0 + max(cagr, -1.0) # nie unter 0
-    dd_penalty  = w_dd * abs(max_dd)     # max_dd ist negativ
-    return sharpe * wr_factor * cagr_bonus - dd_penalty
-
-
-st.subheader("🧭 Parameter-Optimierung")
-with st.expander("Optimizer (Random Search · Composite Score · Walk-Forward)", expanded=False):
-
-    st.markdown(
-        "**Score = Sharpe × (2 × Winrate) × (1 + CAGR) − w_DD × |MaxDD|**  \n"
-        "Keine Trade-Anzahl-Bedingung – die Strategie wird rein nach "
-        "Qualität der Ergebnisse bewertet.",
-        help=(
-            "Sharpe: Kern-Metrik\n"
-            "Winrate: Multiplikator (>50% = Bonus)\n"
-            "CAGR: Wachstumsbonus\n"
-            "MaxDD: Drawdown-Abzug (Gewicht w_DD einstellbar)"
-        ),
-    )
-
-    # ── Score-Gewichte ────────────────────────────────────────
-    sc1, sc2 = st.columns(2)
-    with sc1:
-        w_dd_penalty = st.number_input(
-            "Drawdown-Gewicht w_DD",
-            min_value=0.0, max_value=10.0, value=1.5, step=0.1, format="%.1f",
-            help=(
-                "Wie stark wird ein hoher Max-Drawdown bestraft?\n"
-                "0 = ignorieren · 1 = linear · 2 = doppelt gewichtet"
-            ),
-        )
-    with sc2:
-        n_trials = st.number_input("Trials", 10, 2000, 150, step=10)
-
-    seed = st.number_input("Seed (Reproduzierbarkeit)", 0, 10_000, 42)
-
-    # ── Suchraum ──────────────────────────────────────────────
-    st.markdown("**Suchraum**")
-    lb_lo,  lb_hi  = st.slider("Lookback",         10, 252, (20, 120), step=5)
-    hz_lo,  hz_hi  = st.slider("Horizon",          1,  10,  (3,  8))
-    thr_lo, thr_hi = st.slider(
-        "Threshold Target", 0.0, 0.10, (0.030, 0.10), step=0.005, format="%.3f"
-    )
-    en_lo, en_hi = st.slider("Entry Prob Range", 0.0, 1.0, (0.50, 0.90), step=0.01)
-    ex_lo, ex_hi = st.slider("Exit Prob Range",  0.0, 1.0, (0.25, 0.65), step=0.01)
-
-    @st.cache_data(show_spinner=False)
-    def _get_prices_for_optimizer(
-        tickers: tuple, start: str, end: str,
-        use_tail: bool, interval: str,
-        fallback_last: bool, exec_key: str, moc_cutoff: int,
-    ):
-        return load_all_prices(
-            list(tickers), start, end, use_tail, interval,
-            fallback_last, exec_key, moc_cutoff,
-        )[0]
-
-    def _sample_params(rng):
-        return dict(
-            lookback=rng.randrange(lb_lo, lb_hi + 1, 5),
-            horizon =rng.randrange(hz_lo, hz_hi + 1, 1),
-            thresh  =rng.uniform(thr_lo, thr_hi),
-            entry   =rng.uniform(en_lo,  en_hi),
-            exit    =rng.uniform(ex_lo,  ex_hi),
-        )
-
-    if st.button("🔎 Suche starten", type="primary", use_container_width=True):
-        import random
-        rng = random.Random(int(seed))
-        price_map_opt = _get_prices_for_optimizer(
-            tuple(TICKERS), str(START_DATE), str(END_DATE),
-            use_live, intraday_interval, fallback_last_session,
-            exec_mode, int(moc_cutoff_min),
-        )
-        rows_opt, best_opt = [], None
-        prog_opt  = st.progress(0.0)
-        status_tx = st.empty()
-
-        feasible_tickers = [
-            tk for tk, df in price_map_opt.items()
-            if df is not None and len(df) >= 80
-        ]
-        if not feasible_tickers:
-            st.warning("Keine ausreichenden Preisdaten für Optimierung.")
-        else:
-            for t in range(int(n_trials)):
-                p = _sample_params(rng)
-
-                # Ungültige Kombination überspringen
-                if p["exit"] >= p["entry"]:
-                    prog_opt.progress((t + 1) / n_trials)
-                    continue
-
-                # Metriken über alle Ticker und beide Hälften sammeln
-                sharpes, winrates, cagrs, dds = [], [], [], []
-                trades_total = 0
-                feasible     = 0
-
-                for tk in feasible_tickers:
-                    df = price_map_opt.get(tk)
-                    min_len = max(60, p["lookback"] + p["horizon"] + 5)
-                    if df is None or len(df) < min_len:
-                        continue
-                    feasible += 1
-                    mid = len(df) // 2
-
-                    for sub in (df.iloc[:mid], df.iloc[mid:]):
-                        if len(sub) < min_len:
-                            continue
-                        try:
-                            _, df_bt, trades_sub, mets = make_features_and_train(
-                                sub, p["lookback"], p["horizon"], p["thresh"],
-                                MODEL_PARAMS, p["entry"], p["exit"],
-                                min_hold_days=int(MIN_HOLD_DAYS),
-                                cooldown_days=int(COOLDOWN_DAYS),
-                                walk_forward=True,
-                                use_ensemble=False,   # Geschwindigkeit im Optimizer
-                                use_vol_sizing=USE_VOL_SIZING,
-                                target_vol_annual=TARGET_VOL_ANNUAL,
-                                wf_stride=max(int(WF_STRIDE), 5),  # mind. 5 im Optimizer
-                            )
-                            # Alle Score-Komponenten sammeln
-                            sharpes.append(mets["Sharpe-Ratio"])
-                            wr = mets.get("Winrate (%)", np.nan)
-                            winrates.append(wr / 100.0 if np.isfinite(wr) else np.nan)
-                            cg = mets.get("CAGR (%)", np.nan)
-                            cagrs.append(cg / 100.0 if np.isfinite(cg) else np.nan)
-                            dds.append(mets.get("Max Drawdown (%)", np.nan) / 100.0)
-                            trades_total += int(mets["Number of Trades"])
-                        except Exception:
-                            pass
-
-                if feasible == 0 or not sharpes:
-                    prog_opt.progress((t + 1) / n_trials)
-                    continue
-
-                # Median je Komponente → robust gegen Ausreißer
-                sh_med  = float(np.nanmedian(sharpes))
-                wr_med  = float(np.nanmedian(winrates))
-                cg_med  = float(np.nanmedian(cagrs))
-                dd_med  = float(np.nanmedian(dds))
-
-                # Composite Score (trade-count-unabhängig)
-                score = _composite_score(
-                    sharpe  = sh_med,
-                    winrate = wr_med,
-                    cagr    = cg_med,
-                    max_dd  = dd_med,
-                    w_dd    = float(w_dd_penalty),
-                )
-
-                if not np.isfinite(score):
-                    prog_opt.progress((t + 1) / n_trials)
-                    continue
-
-                rec = dict(
-                    trial       = t,
-                    score       = round(score, 4),
-                    sharpe_med  = round(sh_med, 3),
-                    winrate_med = round(wr_med * 100, 1),
-                    cagr_med    = round(cg_med * 100, 2),
-                    maxdd_med   = round(dd_med * 100, 2),
-                    trades      = trades_total,
-                    **p,
-                )
-                rows_opt.append(rec)
-                if best_opt is None or score > best_opt["score"]:
-                    best_opt = rec
-
-                status_tx.caption(
-                    f"Trial {t+1}/{int(n_trials)} | "
-                    f"Bester Score bisher: {best_opt['score']:.3f}"
-                )
-                prog_opt.progress((t + 1) / n_trials)
-
-            status_tx.empty()
-
-            if not rows_opt:
-                st.warning("Keine gültigen Kandidaten gefunden.")
-            else:
-                df_res = (
-                    pd.DataFrame(rows_opt)
-                    .sort_values("score", ascending=False)
-                    .reset_index(drop=True)
-                )
-
-                # ── Ergebnis-Banner ───────────────────────────
-                st.success(
-                    f"✅  Beste Parameter gefunden — "
-                    f"Score **{best_opt['score']:.3f}** | "
-                    f"Sharpe **{best_opt['sharpe_med']:.2f}** | "
-                    f"Winrate **{best_opt['winrate_med']:.1f}%** | "
-                    f"CAGR **{best_opt['cagr_med']:.1f}%** | "
-                    f"MaxDD **{best_opt['maxdd_med']:.1f}%** | "
-                    f"Trades **{best_opt['trades']}**"
-                )
-
-                # ── Parameter-Kacheln ─────────────────────────
-                st.markdown("**▶ Optimale Parameter – direkt übernehmen:**")
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Lookback",      int(best_opt["lookback"]))
-                c2.metric("Horizon",       int(best_opt["horizon"]))
-                c3.metric("Threshold",     f"{best_opt['thresh']:.3f}")
-                c4.metric("Entry Prob",    f"{best_opt['entry']:.2f}")
-                c5.metric("Exit Prob",     f"{best_opt['exit']:.2f}")
-
-                # ── Score-Komponenten Visualisierung ──────────
-                st.markdown("### 📈 Score-Komponenten (Top 25)")
-                top25 = df_res.head(25).copy()
-
-                fig_sc = go.Figure()
-                fig_sc.add_trace(go.Bar(
-                    name="Sharpe (Median)",
-                    x=top25["trial"].astype(str),
-                    y=top25["sharpe_med"],
-                    marker_color="#6366F1",
-                ))
-                fig_sc.add_trace(go.Bar(
-                    name="Winrate % (Median)",
-                    x=top25["trial"].astype(str),
-                    y=top25["winrate_med"],
-                    marker_color="#10B981",
-                    visible="legendonly",
-                ))
-                fig_sc.add_trace(go.Bar(
-                    name="CAGR % (Median)",
-                    x=top25["trial"].astype(str),
-                    y=top25["cagr_med"],
-                    marker_color="#F59E0B",
-                    visible="legendonly",
-                ))
-                fig_sc.add_trace(go.Bar(
-                    name="MaxDD % (Median, negativ gut)",
-                    x=top25["trial"].astype(str),
-                    y=top25["maxdd_med"],
-                    marker_color="#EF4444",
-                    visible="legendonly",
-                ))
-                fig_sc.add_trace(go.Scatter(
-                    name="Composite Score",
-                    x=top25["trial"].astype(str),
-                    y=top25["score"],
-                    mode="lines+markers",
-                    line=dict(color="black", width=2),
-                    marker=dict(size=7),
-                ))
-                fig_sc.update_layout(
-                    barmode="group",
-                    height=380,
-                    margin=dict(t=30, b=40, l=40, r=20),
-                    legend=dict(orientation="h", y=-0.25),
-                    xaxis_title="Trial-Nr.",
-                    yaxis_title="Wert",
-                )
-                st.plotly_chart(fig_sc, use_container_width=True)
-
-                # ── Scatter: Sharpe vs Winrate ─────────────────
-                st.markdown("### 🔵 Sharpe vs. Winrate (alle Trials)")
-                fig_sc2 = px.scatter(
-                    df_res,
-                    x="sharpe_med", y="winrate_med",
-                    color="score",
-                    size=df_res["score"].clip(lower=0) + 0.01,
-                    hover_data=["trial", "lookback", "horizon",
-                                "thresh", "entry", "exit",
-                                "cagr_med", "maxdd_med", "trades"],
-                    color_continuous_scale="RdYlGn",
-                    labels={
-                        "sharpe_med":  "Sharpe (Median)",
-                        "winrate_med": "Winrate % (Median)",
-                        "score":       "Score",
+        split_idx = len(df) // 2
+        halves = [df.iloc[:split_idx].copy(), df.iloc[split_idx:].copy()]
+        for part in halves:
+            if len(part) < max(params["lookback"] + params["horizon"] + 80, 120):
+                continue
+            try:
+                _, bt, trades, summary = make_features_and_backtest(
+                    df=part,
+                    lookback=params["lookback"],
+                    horizon=params["horizon"],
+                    threshold=params["threshold"],
+                    model_params={
+                        "max_iter": params["max_iter"],
+                        "learning_rate": params["learning_rate"],
+                        "max_depth": params["max_depth"],
+                        "min_samples_leaf": params["min_samples_leaf"],
+                        "l2_regularization": params["l2_regularization"],
                     },
-                    title="Sharpe vs. Winrate – Farbe = Composite Score",
+                    entry_prob=params["entry_prob"],
+                    exit_prob=params["exit_prob"],
+                    min_hold_days=base_settings["min_hold_days"],
+                    cooldown_days=base_settings["cooldown_days"],
+                    walk_forward=True,
+                    use_vol_sizing=base_settings["use_vol_sizing"],
+                    target_vol_annual=base_settings["target_vol_annual"],
+                    base_pos_frac=base_settings["pos_frac"],
+                    commission=base_settings["commission"],
+                    slippage_bps=base_settings["slippage_bps"],
+                    init_cap=base_settings["init_cap"],
+                    wf_stride=params["wf_stride"],
+                    use_calibration=base_settings["use_calibration"],
+                    calibration_frac=base_settings["calibration_frac"],
                 )
-                fig_sc2.update_layout(
-                    height=420, margin=dict(t=45, b=40, l=40, r=20)
+                metric = composite_score(
+                    sharpe=summary["Sharpe"],
+                    winrate=(summary["Win Rate (%)"] / 100.0) if np.isfinite(summary["Win Rate (%)"]) else np.nan,
+                    cagr=(summary["CAGR (%)"] / 100.0) if np.isfinite(summary["CAGR (%)"]) else np.nan,
+                    max_dd=(summary["Max DD (%)"] / 100.0) if np.isfinite(summary["Max DD (%)"]) else np.nan,
+                    w_dd=w_dd,
                 )
-                st.plotly_chart(fig_sc2, use_container_width=True)
-
-                # ── Ergebnis-Tabelle ──────────────────────────
-                st.caption(
-                    "Score = Sharpe × (2·Winrate) × (1+CAGR) − w_DD·|MaxDD| "
-                    f"(w_DD={w_dd_penalty:.1f}) · Keine Trade-Anzahl-Bedingung"
+                scores.append(metric)
+                diagnostics.append(
+                    {
+                        "Ticker": tk,
+                        "Stage": stage_name,
+                        "Score": metric,
+                        "Sharpe": summary["Sharpe"],
+                        "Win Rate (%)": summary["Win Rate (%)"],
+                        "CAGR (%)": summary["CAGR (%)"],
+                        "Max DD (%)": summary["Max DD (%)"],
+                        "Closed Trades": summary["Closed Trades"],
+                    }
                 )
-                display_cols = [
-                    "trial", "score", "sharpe_med", "winrate_med",
-                    "cagr_med", "maxdd_med", "trades",
-                    "lookback", "horizon", "thresh", "entry", "exit",
-                ]
-                st.dataframe(
-                    df_res[display_cols].head(25).style.format({
-                        "score":        "{:.4f}",
-                        "sharpe_med":   "{:.3f}",
-                        "winrate_med":  "{:.1f}",
-                        "cagr_med":     "{:.2f}",
-                        "maxdd_med":    "{:.2f}",
-                        "thresh":       "{:.4f}",
-                        "entry":        "{:.3f}",
-                        "exit":         "{:.3f}",
-                    }).background_gradient(subset=["score"], cmap="RdYlGn"),
-                    use_container_width=True,
-                )
-                st.download_button(
-                    "Optimierergebnisse als CSV",
-                    to_csv_eu(df_res[display_cols]),
-                    file_name="param_search_results.csv",
-                    mime="text/csv",
-                )
-
-
-# ─────────────────────────────────────────────────────────────
-# Haupt-Pipeline
-# ─────────────────────────────────────────────────────────────
-st.markdown(
-    "<h1 style='font-size:36px;'>📈 PROTEUS – AI Modell (v2)</h1>",
-    unsafe_allow_html=True,
-)
-
-mode_label = "Walk-Forward ✓" if USE_WALK_FORWARD else "Volltraining ⚠️"
-ens_label  = "Ensemble (GBM+RF+LR)" if USE_ENSEMBLE else "Single GBM"
-vs_label   = f"Vol-Sizing ({TARGET_VOL_ANNUAL*100:.0f}% Ziel)" if USE_VOL_SIZING else "Fixe Positionsgröße"
-st.caption(f"Modus: **{mode_label}** | Modell: **{ens_label}** | Sizing: **{vs_label}** | WF-Stride: **{int(WF_STRIDE)} Tage**")
-
-results: List[dict]                  = []
-all_trades: Dict[str, List[dict]]    = {}
-all_dfs:    Dict[str, pd.DataFrame]  = {}
-all_feat:   Dict[str, pd.DataFrame]  = {}
-
-price_map, meta_map = load_all_prices(
-    TICKERS, str(START_DATE), str(END_DATE),
-    use_live, intraday_interval, fallback_last_session,
-    exec_mode, int(moc_cutoff_min),
-)
-
-# Options-Aggregate  (SPEEDUP: parallel mit ThreadPoolExecutor)
-options_live: Dict[str, pd.DataFrame] = {}
-if use_chain_live:
-    st.info("Optionsketten je Aktie einlesen … (parallel)")
-    prog_opt2 = st.progress(0.0)
-    tks       = list(price_map.keys())
-
-    def _fetch_chain(tk):
-        df_tk = price_map.get(tk)
-        if df_tk is None or df_tk.empty:
-            return tk, pd.DataFrame()
-        ref = float(df_tk["Close"].iloc[-1])
-        try:
-            return tk, get_equity_chain_aggregates_for_today(
-                tk, ref, atm_band_pct, int(n_expiries), int(max_days_to_exp)
-            )
-        except Exception:
-            return tk, pd.DataFrame()
-
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(tks)))) as _ex:
-        _futs = {_ex.submit(_fetch_chain, tk): tk for tk in tks}
-        _done = 0
-        for fut in _futs:
-            tk_res, ch_res = fut.result()
-            if not ch_res.empty:
-                options_live[tk_res] = ch_res
-            _done += 1
-            prog_opt2.progress(_done / max(1, len(tks)))
-
-live_forecasts_run: List[dict] = []
-
-# ── SPEEDUP: Modell-Training aller Ticker parallel vorausberechnen ──────────
-# make_features_and_train ist CPU-intensiv (sklearn) → ThreadPoolExecutor
-# gibt hier spürbare Beschleunigung für 6-15 Ticker.
-def _run_ticker(ticker: str):
-    """Worker: berechnet Features + Training für einen Ticker."""
-    df   = price_map.get(ticker)
-    meta = meta_map.get(ticker, {})
-    if df is None or df.empty:
-        return ticker, None
-
-    exog_tk = None
-    if (
-        use_chain_live
-        and ticker in options_live
-        and not options_live[ticker].empty
-    ):
-        ch = options_live[ticker].copy()
-        ch.index = [df.index[-1].normalize()]
-        exog_tk  = ch
-    try:
-        feat, df_bt, trades, metrics = make_features_and_train(
-            df, LOOKBACK, HORIZON, THRESH, MODEL_PARAMS,
-            ENTRY_PROB, EXIT_PROB,
-            min_hold_days=int(MIN_HOLD_DAYS),
-            cooldown_days=int(COOLDOWN_DAYS),
-            exog_df=exog_tk,
-            walk_forward=USE_WALK_FORWARD,
-            use_ensemble=USE_ENSEMBLE,
-            use_vol_sizing=USE_VOL_SIZING,
-            target_vol_annual=TARGET_VOL_ANNUAL,
-            wf_stride=int(WF_STRIDE),
-        )
-        return ticker, (feat, df_bt, trades, metrics, meta, exog_tk)
-    except Exception as e:
-        return ticker, e
-
-valid_tickers = [tk for tk in TICKERS if tk in price_map]
-compute_results: Dict[str, object] = {}
-
-if valid_tickers:
-    st.info(f"Modell-Training für {len(valid_tickers)} Ticker … (parallel, Stride={int(WF_STRIDE)})")
-    prog_train = st.progress(0.0)
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(valid_tickers))) as _ex:
-        _fmap = {_ex.submit(_run_ticker, tk): tk for tk in valid_tickers}
-        _done = 0
-        for fut in _fmap:
-            tk_res        = _fmap[fut]
-            compute_results[tk_res] = fut.result()[1]
-            _done += 1
-            prog_train.progress(_done / len(valid_tickers))
-
-for ticker in TICKERS:
-    if ticker not in price_map:
-        continue
-    df    = price_map[ticker]
-    meta  = meta_map.get(ticker, {})
-    _res  = compute_results.get(ticker)
-
-    with st.expander(f"🔍 Analyse für {ticker}", expanded=False):
-        st.subheader(f"{ticker} — {get_ticker_name(ticker)}")
-        try:
-            last_timestamp_info(df, meta)
-
-            if _res is None or isinstance(_res, Exception):
-                err_msg = str(_res) if isinstance(_res, Exception) else "Keine Daten"
-                st.error(f"Fehler bei {ticker}: {err_msg}")
+            except Exception:
                 continue
 
-            feat, df_bt, trades, metrics, meta, exog_tk = _res
-
-            # Interne Felder aus metrics-Dict herausziehen
-            last_fi = metrics.pop("_feature_importance", None)
-            x_cols  = metrics.pop("_x_cols", BASE_FEATURE_COLS)
-
-            metrics["Ticker"] = ticker
-            results.append(metrics)
-            all_trades[ticker] = trades
-            all_dfs[ticker]    = df_bt
-            all_feat[ticker]   = feat
-
-            def _decide_action_local(p: float, entry_thr: float, exit_thr: float) -> str:
-                if p > entry_thr:   return "Enter / Add"
-                if p < exit_thr:    return "Exit / Reduce"
-                return "Hold / No Trade"
-
-            live_ts    = pd.Timestamp(feat.index[-1])
-            live_prob  = float(feat["SignalProb"].iloc[-1])
-            live_close = float(feat["Close"].iloc[-1]) if "Close" in feat.columns else np.nan
-            tail_info  = "intraday" if meta.get("tail_is_intraday") else "daily"
-
-            row = {
-                "AsOf":   live_ts.strftime("%Y-%m-%d %H:%M"),
-                "Ticker": ticker,
-                "Name":   get_ticker_name(ticker),
-                f"P(>{THRESH:.3f} in {HORIZON}d)": round(live_prob, 4),
-                "Action": _decide_action_local(live_prob, ENTRY_PROB, EXIT_PROB),
-                "Close":  round(live_close, 4),
-                "Bar":    tail_info,
-            }
-            if use_chain_live and exog_tk is not None:
-                vals = exog_tk.iloc[-1]
-                for col in [
-                    "PCR_vol", "PCR_oi", "VOI_call", "VOI_put",
-                    "IV_skew_p_minus_c", "VOL_tot", "OI_tot",
-                ]:
-                    if col in vals and pd.notna(vals[col]):
-                        row[col] = round(float(vals[col]), 4)
-            live_forecasts_run.append(row)
-
-            # ── KPI Tiles ───────────────────────────────────────
-            c1, c2, c3, c4, c5, c6 = st.columns(6)
-            c1.metric("Strategie Netto (%)",  f"{metrics['Strategy Net (%)']:.2f}")
-            c2.metric("Buy & Hold (%)",       f"{metrics['Buy & Hold Net (%)']:.2f}")
-            c3.metric("Sharpe",               f"{metrics['Sharpe-Ratio']:.2f}")
-            c4.metric(
-                "Sortino",
-                f"{metrics['Sortino-Ratio']:.2f}" if np.isfinite(metrics["Sortino-Ratio"]) else "–",
-            )
-            c5.metric("Max DD (%)",           f"{metrics['Max Drawdown (%)']:.2f}")
-            c6.metric("Trades (Round-Trips)", f"{int(metrics['Number of Trades'])}")
-
-            # ── Charts ──────────────────────────────────────────
-            chart_cols = st.columns(2)
-
-            # Preis + Signale (farbkodiert)
-            df_plot    = feat.copy()
-            price_fig  = go.Figure()
-            price_fig.add_trace(go.Scatter(
-                x=df_plot.index, y=df_plot["Close"],
-                mode="lines", name="Close",
-                line=dict(color="rgba(0,0,0,0.4)", width=1),
-                hovertemplate="Datum: %{x|%Y-%m-%d}<br>Close: %{y:.2f}<extra></extra>",
-            ))
-            signal_probs = df_plot["SignalProb"]
-            norm = (signal_probs - signal_probs.min()) / (
-                signal_probs.max() - signal_probs.min() + 1e-9
-            )
-            for idx in range(len(df_plot) - 1):
-                seg_x = df_plot.index[idx: idx + 2]
-                seg_y = df_plot["Close"].iloc[idx: idx + 2]
-                color_seg = px.colors.sample_colorscale(
-                    px.colors.diverging.RdYlGn, float(norm.iloc[idx])
-                )[0]
-                price_fig.add_trace(go.Scatter(
-                    x=seg_x, y=seg_y, mode="lines", showlegend=False,
-                    line=dict(color=color_seg, width=2), hoverinfo="skip",
-                ))
-            # FIX 5: trades_df nur einmal definieren
-            trades_df = pd.DataFrame(trades)
-            if not trades_df.empty:
-                trades_df["Date"] = pd.to_datetime(trades_df["Date"])
-                entries = trades_df[trades_df["Typ"] == "Entry"]
-                exits   = trades_df[trades_df["Typ"] == "Exit"]
-                price_fig.add_trace(go.Scatter(
-                    x=entries["Date"], y=entries["Price"],
-                    mode="markers", name="Entry",
-                    marker_symbol="triangle-up",
-                    marker=dict(size=12, color="green"),
-                    hovertemplate="Entry<br>Datum:%{x|%Y-%m-%d}<br>Preis:%{y:.2f}<extra></extra>",
-                ))
-                price_fig.add_trace(go.Scatter(
-                    x=exits["Date"], y=exits["Price"],
-                    mode="markers", name="Exit",
-                    marker_symbol="triangle-down",
-                    marker=dict(size=12, color="red"),
-                    hovertemplate="Exit<br>Datum:%{x|%Y-%m-%d}<br>Preis:%{y:.2f}<extra></extra>",
-                ))
-            price_fig.update_layout(
-                title=f"{ticker}: Preis mit Signal-Wahrscheinlichkeit (Daily)",
-                xaxis_title="Datum", yaxis_title="Preis",
-                height=420, margin=dict(t=50, b=30, l=40, r=20),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            )
-            with chart_cols[0]:
-                st.plotly_chart(price_fig, use_container_width=True)
-
-            # Intraday (letzte 5 Handelstage)
-            intra = get_intraday_last_n_sessions(
-                ticker, sessions=5, days_buffer=10, interval=intraday_interval
-            )
-            with chart_cols[1]:
-                if intra.empty:
-                    st.info("Keine Intraday-Daten verfügbar (Ticker/Intervall/Zeitraum).")
-                else:
-                    intr_fig = go.Figure()
-                    if intraday_chart_type == "Candlestick (OHLC)":
-                        intr_fig.add_trace(go.Candlestick(
-                            x=intra.index,
-                            open=intra["Open"], high=intra["High"],
-                            low=intra["Low"],  close=intra["Close"],
-                            name="OHLC (intraday)",
-                            increasing_line_width=1, decreasing_line_width=1,
-                        ))
-                    else:
-                        intr_fig.add_trace(go.Scatter(
-                            x=intra.index, y=intra["Close"],
-                            mode="lines", name="Close (intraday)",
-                            hovertemplate="%{x|%Y-%m-%d %H:%M}<br>Close: %{y:.2f}<extra></extra>",
-                        ))
-                    if not trades_df.empty:
-                        tdf        = trades_df.copy()
-                        last_days  = set(pd.Index(intra.index.normalize().unique()))
-                        ev_recent  = tdf[tdf["Date"].dt.normalize().isin(last_days)].copy()
-                        for typ, color, symbol in [
-                            ("Entry", "green", "triangle-up"),
-                            ("Exit",  "red",   "triangle-down"),
-                        ]:
-                            xs, ys = [], []
-                            for d, day_slice in intra.groupby(intra.index.normalize()):
-                                hit = ev_recent[
-                                    (ev_recent["Typ"] == typ)
-                                    & (ev_recent["Date"].dt.normalize() == d)
-                                ]
-                                if hit.empty:
-                                    continue
-                                ts0   = day_slice.index.min()
-                                y_val = (
-                                    float(hit["Price"].iloc[-1])
-                                    if intraday_chart_type == "Candlestick (OHLC)"
-                                    else float(day_slice["Close"].iloc[0])
-                                )
-                                xs.append(ts0)
-                                ys.append(y_val)
-                            if xs:
-                                intr_fig.add_trace(go.Scatter(
-                                    x=xs, y=ys, mode="markers", name=typ,
-                                    marker_symbol=symbol,
-                                    marker=dict(size=11, color=color),
-                                    hovertemplate=(
-                                        f"{typ}<br>%{{x|%Y-%m-%d %H:%M}}"
-                                        "<br>Preis: %{y:.2f}<extra></extra>"
-                                    ),
-                                ))
-                    intr_fig.update_layout(
-                        title=f"{ticker}: Intraday – letzte 5 Handelstage ({intraday_interval})",
-                        xaxis_title="Zeit", yaxis_title="Preis",
-                        height=420, margin=dict(t=50, b=30, l=40, r=20),
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                    )
-                    for _, day_slice in intra.groupby(intra.index.normalize()):
-                        intr_fig.add_vline(
-                            x=day_slice.index.min(),
-                            line_width=1, line_dash="dot", opacity=0.3,
-                        )
-                    st.plotly_chart(intr_fig, use_container_width=True)
-
-            # Equity-Kurve
-            eq = go.Figure()
-            eq.add_trace(go.Scatter(
-                x=df_bt.index, y=df_bt["Equity_Net"],
-                name="Strategy Net Equity (Next Open)",
-                mode="lines",
-                hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}€<extra></extra>",
-            ))
-            bh_curve = INIT_CAP * df_bt["Close"] / df_bt["Close"].iloc[0]
-            eq.add_trace(go.Scatter(
-                x=df_bt.index, y=bh_curve,
-                name="Buy & Hold", mode="lines",
-                line=dict(dash="dash", color="black"),
-            ))
-            eq.update_layout(
-                title=f"{ticker}: Net Equity-Kurve vs. Buy & Hold",
-                xaxis_title="Datum", yaxis_title="Equity (€)",
-                height=400, margin=dict(t=50, b=30, l=40, r=20),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            )
-            st.plotly_chart(eq, use_container_width=True)
-
-            # NEW 4 – Feature Importance
-            with st.expander("📊 Feature Importance", expanded=False):
-                show_feature_importance(last_fi, x_cols)
-                if x_cols:
-                    st.caption(
-                        f"Verwendete Features ({len(x_cols)}): {', '.join(x_cols)}"
-                    )
-
-            # Trades-Tabelle
-            with st.expander(f"Trades (Next Open) für {ticker}", expanded=False):
-                if not trades_df.empty:
-                    df_tr = trades_df.copy()
-                    df_tr["Ticker"]  = ticker
-                    df_tr["Name"]    = get_ticker_name(ticker)
-                    df_tr["DateStr"] = df_tr["Date"].dt.strftime("%d.%m.%Y")
-                    # FIX 3: .fillna(method="ffill") → .ffill()
-                    df_tr["CumPnL"] = (
-                        df_tr.where(df_tr["Typ"] == "Exit")["Net P&L"]
-                        .cumsum().ffill().fillna(0)
-                    )
-                    df_tr = df_tr.rename(columns={
-                        "Net P&L": "PnL",
-                        "Prob":    "Signal Prob",
-                        "HoldDays": "Hold (days)",
-                        "PosFrac":  "Pos Frac",
-                    })
-
-                    disp_cols = [
-                        "Ticker", "Name", "DateStr", "Typ", "Price",
-                        "Shares", "Signal Prob", "Hold (days)", "Pos Frac",
-                        "PnL", "CumPnL", "Fees",
-                    ]
-                    disp_cols = [c for c in disp_cols if c in df_tr.columns]
-                    styled = df_tr[disp_cols].rename(
-                        columns={"DateStr": "Date"}
-                    ).style.format({
-                        "Price":      "{:.2f}",
-                        "Shares":     "{:.4f}",
-                        "Signal Prob": "{:.4f}",
-                        "Pos Frac":   "{:.4f}",
-                        "PnL":        "{:.2f}",
-                        "CumPnL":     "{:.2f}",
-                        "Fees":       "{:.2f}",
-                    })
-                    show_styled_or_plain(
-                        df_tr[disp_cols].rename(columns={"DateStr": "Date"}), styled
-                    )
-                    st.download_button(
-                        label=f"Trades {ticker} als CSV",
-                        data=to_csv_eu(
-                            df_tr[[
-                                "Ticker", "Name", "Date", "Typ", "Price", "Shares",
-                                "Signal Prob", "Hold (days)", "Pos Frac",
-                                "PnL", "CumPnL", "Fees",
-                            ] if "Pos Frac" in df_tr.columns else [
-                                "Ticker", "Name", "Date", "Typ", "Price", "Shares",
-                                "Signal Prob", "Hold (days)", "PnL", "CumPnL", "Fees",
-                            ]],
-                            float_format="%.4f",
-                        ),
-                        file_name=f"trades_{ticker}.csv",
-                        mime="text/csv",
-                        key=f"dl_trades_{ticker}",
-                    )
-                else:
-                    st.info("Keine Trades vorhanden.")
-
-        except Exception as e:
-            st.error(f"Fehler bei {ticker}: {e}")
-            import traceback
-            st.caption(traceback.format_exc())
+    overall = float(np.median(scores)) if scores else float("-inf")
+    return {"params": params, "score": overall, "details": diagnostics}
 
 
-# ─────────────────────────────────────────────────────────────
-# 🔮 Live-Forecast Board
-# ─────────────────────────────────────────────────────────────
-if live_forecasts_run:
-    live_df = (
-        pd.DataFrame(live_forecasts_run)
-          .drop_duplicates(subset=["Ticker"], keep="last")
-          .sort_values(["AsOf", "Ticker"])
-          .reset_index(drop=True)
+def run_two_stage_optimizer(
+    price_map: Dict[str, pd.DataFrame],
+    tickers: List[str],
+    coarse_trials: int,
+    fine_trials: int,
+    top_k: int,
+    seed: int,
+    base_settings: Dict[str, Any],
+    w_dd: float,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    rng = random.Random(seed)
+    eligible = [tk for tk in tickers if tk in price_map and len(price_map[tk]) >= 160]
+    if not eligible:
+        return pd.DataFrame(), {}
+
+    stage1_tickers = eligible[: max(2, min(len(eligible), max(3, len(eligible) // 2)))]
+    stage2_tickers = eligible
+
+    results: List[Dict[str, Any]] = []
+    for _ in range(int(coarse_trials)):
+        params = sample_params(rng)
+        results.append(evaluate_param_set(params, price_map, stage1_tickers, base_settings, w_dd, "coarse"))
+
+    coarse_df = pd.DataFrame(
+        [{**r["params"], "score": r["score"], "stage": "coarse"} for r in results]
+    ).sort_values("score", ascending=False)
+    top_params = coarse_df.head(int(top_k)).to_dict("records")
+
+    fine_results: List[Dict[str, Any]] = []
+    if top_params:
+        for _ in range(int(fine_trials)):
+            parent = rng.choice(top_params)
+            params = jitter_params(parent, rng)
+            fine_results.append(evaluate_param_set(params, price_map, stage2_tickers, base_settings, w_dd, "fine"))
+
+    fine_df = pd.DataFrame(
+        [{**r["params"], "score": r["score"], "stage": "fine"} for r in fine_results]
     )
-    live_df["Target_5d"] = (
-        pd.to_numeric(live_df["Close"], errors="coerce") * (1.0 + float(THRESH))
-    ).round(2)
+    out = pd.concat([coarse_df, fine_df], ignore_index=True) if not fine_df.empty else coarse_df.copy()
+    out = out.sort_values("score", ascending=False).reset_index(drop=True)
+    best = out.iloc[0].to_dict() if not out.empty else {}
+    return out, best
 
-    prob_col = f"P(>{THRESH:.3f} in {HORIZON}d)"
-    if prob_col not in live_df.columns:
-        cand = [c for c in live_df.columns if c.startswith("P(") and c.endswith("d)")]
-        if cand:
-            prob_col = cand[0]
 
-    if use_chain_live:
-        for c in ["PCR_oi", "PCR_vol", "VOI_call", "VOI_put"]:
-            if c in live_df.columns:
-                s = pd.to_numeric(live_df[c], errors="coerce")
-                live_df[c]       = s
-                live_df[c + "_z"] = (s - s.mean()) / (s.std(ddof=0) + 1e-9)
+# ═══════════════════════════════════════════════════════════════
+# CHARTS
+# ═══════════════════════════════════════════════════════════════
 
-        def col_or_zero(name: str) -> pd.Series:
-            return (
-                pd.to_numeric(live_df[name], errors="coerce")
-                if name in live_df.columns
-                else pd.Series(0.0, index=live_df.index)
-            )
+PLOT_LAYOUT = dict(
+    font_family="Outfit, sans-serif",
+    paper_bgcolor=STONE,
+    plot_bgcolor=STONE,
+    margin=dict(l=0, r=0, t=35, b=0),
+    xaxis=dict(showgrid=False, zeroline=False, showline=False, tickfont=dict(color=INK_LIGHT, size=10)),
+    yaxis=dict(showgrid=True, gridcolor="#DDD8CE", gridwidth=1, zeroline=False, showline=False, tickfont=dict(color=INK_LIGHT, size=10)),
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, font=dict(size=11, color=INK_MID)),
+)
 
-        comp = (
-            -0.6 * col_or_zero("PCR_oi_z").fillna(0.0)
-            - 0.3 * col_or_zero("PCR_vol_z").fillna(0.0)
-            + 0.5 * (
-                col_or_zero("VOI_call_z").fillna(0.0)
-                - col_or_zero("VOI_put_z").fillna(0.0)
-            )
-        )
-        p_base = pd.to_numeric(live_df[prob_col], errors="coerce").fillna(0.0)
-        live_df["P_adj"]      = np.clip(p_base + 0.07 * comp, 0.0, 1.0)
-        live_df["Action_adj"] = live_df["P_adj"].apply(
-            lambda p: (
-                "Enter / Add" if p >= ENTRY_PROB
-                else ("Exit / Reduce" if p <= EXIT_PROB else "Hold / No Trade")
-            )
-        )
-        desired = [
-            "AsOf", "Ticker", "Name", prob_col, "P_adj",
-            "Action", "Action_adj",
-            "PCR_oi", "PCR_vol", "VOI_call", "VOI_put",
-            "Close", "Target_5d", "Bar",
-        ]
-        show_cols = [c for c in desired if c in live_df.columns]
+
+def equity_chart(bt: pd.DataFrame, ticker: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=bt.index, y=bt["Equity_Net"], mode="lines", name="Strategy Equity", line=dict(color=GOLD, width=2.5)))
+    bh = bt["Close"] / bt["Close"].iloc[0] * bt["Equity_Net"].iloc[0]
+    fig.add_trace(go.Scatter(x=bt.index, y=bh, mode="lines", name="Buy & Hold", line=dict(color=DEPTH, width=1.8, dash="dot")))
+    fig.update_layout(title=f"{ticker} — Equity Curve", **PLOT_LAYOUT)
+    return fig
+
+
+def prob_chart(bt: pd.DataFrame, entry_prob: float, exit_prob: float, ticker: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=bt.index, y=bt["SignalProb"], mode="lines", name="Signal Probability", line=dict(color=GOLD_DEEP, width=2)))
+    fig.add_hline(y=entry_prob, line_dash="dash", line_color=RISE, annotation_text="Entry")
+    fig.add_hline(y=exit_prob, line_dash="dash", line_color=FALL, annotation_text="Exit")
+    fig.update_layout(title=f"{ticker} — Calibrated Signal Probability", yaxis_range=[0, 1], **PLOT_LAYOUT)
+    return fig
+
+
+def summary_bar(summary_df: pd.DataFrame) -> go.Figure:
+    fig = px.bar(summary_df.sort_values("Net (%)"), x="Net (%)", y="Ticker", orientation="h")
+    fig.update_traces(marker_color=GOLD, hovertemplate="%{y}: %{x:.2f}%<extra></extra>")
+    fig.update_layout(title="Net Return by Ticker", **PLOT_LAYOUT)
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════
+# UI
+# ═══════════════════════════════════════════════════════════════
+
+def render_header() -> None:
+    st.markdown('<div class="hero-name">NEXUS Maison v3</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero-sub">Faster Walk-Forward · HistGradientBoosting · Probability Calibration</div>', unsafe_allow_html=True)
+    st.markdown('<div class="gold-rule"></div>', unsafe_allow_html=True)
+
+
+def render_sidebar() -> Dict[str, Any]:
+    st.sidebar.header("Strategy Setup")
+
+    ticker_source = st.sidebar.selectbox("Ticker Source", ["Manual", "CSV Upload"], index=0)
+    tickers: List[str] = []
+    if ticker_source == "Manual":
+        tickers_input = st.sidebar.text_input("Tickers (comma-separated)", value="REGN, LULU, VOW3.DE, REI, DDL")
+        tickers = normalize_tickers([t for t in tickers_input.split(",") if t.strip()])
     else:
-        desired   = ["AsOf", "Ticker", "Name", prob_col, "Action", "Close", "Target_5d", "Bar"]
-        show_cols = [c for c in desired if c in live_df.columns]
+        uploads = st.sidebar.file_uploader("CSV files", type=["csv"], accept_multiple_files=True)
+        collected: List[str] = []
+        if uploads:
+            for up in uploads:
+                try:
+                    collected += parse_ticker_csv(up)
+                except Exception as e:
+                    st.sidebar.error(f"CSV read error in {up.name}: {e}")
+        extras = st.sidebar.text_input("Additional tickers", value="")
+        tickers = normalize_tickers(collected + [t for t in extras.split(",") if t.strip()])
 
-    st.markdown(f"### 🟣 Live–Forecast Board – {HORIZON}-Tage Prognose (heute)")
-    styled_live = style_live_board(live_df[show_cols], prob_col, ENTRY_PROB)
-    show_styled_or_plain(live_df[show_cols], styled_live)
-    st.download_button(
-        "Live-Forecasts als CSV",
-        to_csv_eu(live_df),
-        file_name=f"live_forecasts_today_{HORIZON}d.csv",
-        mime="text/csv",
-    )
+    if not tickers:
+        tickers = ["REGN", "LULU", "VOW3.DE"]
 
+    start_date = st.sidebar.date_input("Start Date", value=pd.to_datetime("2024-01-01"))
+    end_date = st.sidebar.date_input("End Date", value=pd.to_datetime(datetime.now(LOCAL_TZ).date()))
 
-# ─────────────────────────────────────────────────────────────
-# Summary / Open Positions / Round-Trips / Korrelation
-# ─────────────────────────────────────────────────────────────
-if results:
-    summary_df = pd.DataFrame(results).set_index("Ticker")
-    summary_df["Net P&L (%)"] = (summary_df["Net P&L (€)"] / INIT_CAP) * 100
+    lookback = int(st.sidebar.number_input("Lookback", min_value=10, max_value=252, value=35, step=5))
+    horizon = int(st.sidebar.number_input("Horizon", min_value=1, max_value=15, value=5, step=1))
+    threshold = float(st.sidebar.number_input("Target Threshold", min_value=0.0, max_value=0.15, value=0.046, step=0.005, format="%.3f"))
+    entry_prob = float(st.sidebar.slider("Entry Threshold", 0.0, 1.0, 0.62, step=0.01))
+    exit_prob = float(st.sidebar.slider("Exit Threshold", 0.0, 1.0, 0.48, step=0.01))
+    if exit_prob >= entry_prob:
+        st.sidebar.error("Exit Threshold must be below Entry Threshold.")
+        st.stop()
 
-    total_net_pnl          = summary_df["Net P&L (€)"].sum()
-    total_fees             = summary_df["Fees (€)"].sum()
-    total_gross_pnl        = total_net_pnl + total_fees
-    total_trades           = summary_df["Number of Trades"].sum()
-    total_capital          = INIT_CAP * len(summary_df)
-    total_net_return_pct   = total_net_pnl / total_capital * 100
-    total_gross_return_pct = total_gross_pnl / total_capital * 100
+    min_hold_days = int(st.sidebar.number_input("Minimum Hold Days", 0, 252, 5, step=1))
+    cooldown_days = int(st.sidebar.number_input("Cooldown Days", 0, 252, 0, step=1))
+    commission = float(st.sidebar.number_input("Commission", 0.0, 0.02, 0.004, step=0.0001, format="%.4f"))
+    slippage_bps = float(st.sidebar.number_input("Slippage (bp)", 0, 50, 5, step=1))
+    pos_frac = float(st.sidebar.slider("Position Size", 0.1, 1.0, 1.0, step=0.1))
+    init_cap = float(st.sidebar.number_input("Initial Capital (€)", min_value=1000.0, value=10_000.0, step=1000.0, format="%.2f"))
 
-    st.subheader("📊 Summary of all Tickers (Next Open Backtest)")
-    cols = st.columns(4)
-    cols[0].metric("Cumulative Net P&L (€)",       f"{total_net_pnl:,.2f}")
-    cols[1].metric("Cumulative Trading Costs (€)",  f"{total_fees:,.2f}")
-    cols[2].metric("Cumulative Gross P&L (€)",      f"{total_gross_pnl:,.2f}")
-    cols[3].metric("Total Number of Trades",        f"{int(total_trades)}")
+    st.sidebar.markdown("**Execution / Data**")
+    use_live = st.sidebar.checkbox("Use intraday tail for latest day", value=True)
+    intraday_interval = st.sidebar.selectbox("Intraday Interval", ["1m", "2m", "5m", "15m"], index=2)
+    fallback_last_session = st.sidebar.checkbox("Fallback to last session", value=False)
+    exec_mode = st.sidebar.selectbox("Execution Mode", ["Next Open (backtest+live)", "Market-On-Close (live only)"])
+    moc_cutoff_min = int(st.sidebar.number_input("MOC cutoff (minutes before close)", 5, 60, 15, step=5))
 
-    bh_total_pct = float(
-        summary_df["Buy & Hold Net (%)"].dropna().mean()
-    ) if "Buy & Hold Net (%)" in summary_df.columns else float("nan")
+    st.sidebar.markdown("**Model — HistGradientBoosting**")
+    walk_forward = st.sidebar.checkbox("Walk-Forward", value=True)
+    max_iter = int(st.sidebar.number_input("max_iter", 40, 400, 120, step=10))
+    learning_rate = float(st.sidebar.number_input("learning_rate", 0.01, 0.30, 0.08, step=0.01, format="%.2f"))
+    max_depth = int(st.sidebar.number_input("max_depth", 2, 10, 4, step=1))
+    min_samples_leaf = int(st.sidebar.number_input("min_samples_leaf", 5, 50, 20, step=5))
+    l2_regularization = float(st.sidebar.number_input("l2_regularization", 0.0, 5.0, 0.3, step=0.1))
+    wf_stride = int(st.sidebar.number_input("Walk-Forward Stride", 1, 30, 5, step=1))
 
-    cols_pct = st.columns(4)
-    cols_pct[0].metric("Strategy Net (%) – total",   f"{total_net_return_pct:.2f}")
-    cols_pct[1].metric("Strategy Gross (%) – total", f"{total_gross_return_pct:.2f}")
-    cols_pct[2].metric("Buy & Hold Net (%) – total", f"{bh_total_pct:.2f}")
-    cols_pct[3].metric(
-        "Durchschn. CAGR (%)",
-        f"{summary_df['CAGR (%)'].dropna().mean():.2f}"
-        if "CAGR (%)" in summary_df else "–",
-    )
+    st.sidebar.markdown("**Probability Calibration**")
+    use_calibration = st.sidebar.checkbox("Enable calibration", value=True)
+    calibration_frac = float(st.sidebar.slider("Calibration split", 0.10, 0.35, 0.20, step=0.05))
 
-    def color_phase_html(val: str) -> str:
-        colors = {"Open": "#d0ebff", "Flat": "#f0f0f0"}
-        return f"background-color: {colors.get(val, '#ffffff')};"
-
-    # FIX 3: Styler.applymap → Styler.map
-    styled_summary = (
-        summary_df.style
-        .format({
-            "Strategy Net (%)":   "{:.2f}",
-            "Strategy Gross (%)": "{:.2f}",
-            "Buy & Hold Net (%)": "{:.2f}",
-            "Volatility (%)":     "{:.2f}",
-            "Sharpe-Ratio":       "{:.2f}",
-            "Sortino-Ratio":      "{:.2f}",
-            "Max Drawdown (%)":   "{:.2f}",
-            "Calmar-Ratio":       "{:.2f}",
-            "Fees (€)":           "{:.2f}",
-            "Net P&L (%)":        "{:.2f}",
-            "Net P&L (€)":        "{:.2f}",
-            "CAGR (%)":           "{:.2f}",
-            "Winrate (%)":        "{:.2f}",
-        })
-        .map(
-            lambda v: "font-weight: bold;" if isinstance(v, (int, float)) else "",
-            subset=pd.IndexSlice[:, ["Sharpe-Ratio", "Sortino-Ratio"]],
+    st.sidebar.markdown("**Position Sizing**")
+    use_vol_sizing = st.sidebar.checkbox("Volatility-scaled single-position sizing", value=False)
+    target_vol_annual = float(
+        st.sidebar.number_input(
+            "Target annualized volatility (%)",
+            min_value=5.0,
+            max_value=50.0,
+            value=15.0,
+            step=1.0,
+            help="This scales each individual position by its own realized volatility. It is not portfolio-level volatility targeting.",
         )
-        .map(color_phase_html, subset=["Phase"])
-        .set_caption("Strategy-Performance per Ticker (Next Open Execution)")
-    )
-    show_styled_or_plain(summary_df, styled_summary)
-    st.download_button(
-        "Summary als CSV herunterladen",
-        to_csv_eu(summary_df.reset_index()),
-        file_name="strategy_summary.csv",
-        mime="text/csv",
+        / 100.0
     )
 
-    # ── Open Positions ──────────────────────────────────────
-    st.subheader("📋 Open Positions (Next Open Backtest)")
-    NAME_OVERRIDES = {
-        "QBTS": "D-Wave Quantum Inc.",
-        "NOG":  "Northern Oil and Gas, Inc.",
-        "LUMN": "Lumen Technologies, Inc.",
+    st.sidebar.markdown("**Optimizer**")
+    enable_optimizer = st.sidebar.checkbox("Run two-stage optimizer", value=False)
+    coarse_trials = int(st.sidebar.number_input("Coarse trials", 5, 300, 40, step=5))
+    fine_trials = int(st.sidebar.number_input("Fine trials", 5, 300, 20, step=5))
+    top_k = int(st.sidebar.number_input("Top-k seeds", 1, 20, 5, step=1))
+    w_dd = float(st.sidebar.number_input("Drawdown weight", 0.0, 10.0, 1.5, step=0.1))
+    opt_seed = int(st.sidebar.number_input("Optimizer seed", 0, 10000, 42, step=1))
+
+    if st.sidebar.button("Clear cache"):
+        st.cache_data.clear()
+        st.rerun()
+
+    return {
+        "tickers": tickers,
+        "start_date": start_date,
+        "end_date": end_date,
+        "lookback": lookback,
+        "horizon": horizon,
+        "threshold": threshold,
+        "entry_prob": entry_prob,
+        "exit_prob": exit_prob,
+        "min_hold_days": min_hold_days,
+        "cooldown_days": cooldown_days,
+        "commission": commission,
+        "slippage_bps": slippage_bps,
+        "pos_frac": pos_frac,
+        "init_cap": init_cap,
+        "use_live": use_live,
+        "intraday_interval": intraday_interval,
+        "fallback_last_session": fallback_last_session,
+        "exec_mode": exec_mode,
+        "moc_cutoff_min": moc_cutoff_min,
+        "walk_forward": walk_forward,
+        "model_params": {
+            "max_iter": max_iter,
+            "learning_rate": learning_rate,
+            "max_depth": max_depth,
+            "min_samples_leaf": min_samples_leaf,
+            "l2_regularization": l2_regularization,
+        },
+        "wf_stride": wf_stride,
+        "use_calibration": use_calibration,
+        "calibration_frac": calibration_frac,
+        "use_vol_sizing": use_vol_sizing,
+        "target_vol_annual": target_vol_annual,
+        "enable_optimizer": enable_optimizer,
+        "coarse_trials": coarse_trials,
+        "fine_trials": fine_trials,
+        "top_k": top_k,
+        "w_dd": w_dd,
+        "opt_seed": opt_seed,
     }
-    open_positions = []
-    for ticker, trades in all_trades.items():
-        if trades and trades[-1]["Typ"] == "Entry":
-            last_entry = next(t for t in reversed(trades) if t["Typ"] == "Entry")
-            entry_ts   = pd.to_datetime(last_entry["Date"])
-            prob       = float(all_feat[ticker]["SignalProb"].iloc[-1])
-            last_close = float(all_dfs[ticker]["Close"].iloc[-1])
-            upnl       = (
-                (last_close - float(last_entry["Price"])) * float(last_entry["Shares"])
-            )
-            name = NAME_OVERRIDES.get(ticker) or get_ticker_name(ticker) or ticker
-            open_positions.append({
-                "Ticker":              ticker,
-                "Name":               name,
-                "Entry Date":         entry_ts,
-                "Entry Price":        round(float(last_entry["Price"]), 2),
-                "Pos Frac":           round(float(last_entry.get("PosFrac", np.nan)), 4),
-                "Current Prob.":      round(prob, 4),
-                "Unrealized PnL (€)": round(upnl, 2),
-            })
 
-    if open_positions:
-        open_df         = pd.DataFrame(open_positions).sort_values(
-            "Entry Date", ascending=False
-        )
-        open_df_display = open_df.copy()
-        open_df_display["Entry Date"] = open_df_display["Entry Date"].dt.strftime(
-            "%Y-%m-%d"
-        )
-        styled_open = open_df_display.style.format({
-            "Entry Price":        "{:.2f}",
-            "Pos Frac":           "{:.4f}",
-            "Current Prob.":      "{:.4f}",
-            "Unrealized PnL (€)": "{:.2f}",
-        })
-        show_styled_or_plain(open_df_display, styled_open)
-        st.download_button(
-            "Offene Positionen als CSV",
-            to_csv_eu(open_df),
-            file_name="open_positions.csv",
-            mime="text/csv",
-        )
-    else:
-        st.success("Keine offenen Positionen.")
 
-    # ── Round-Trips ──────────────────────────────────────────
-    rt_df = compute_round_trips(all_trades)
-    if not rt_df.empty:
-        st.subheader("🔁 Abgeschlossene Trades (Round-Trips) – Filter")
+def style_live_board(df: pd.DataFrame, prob_col: str, entry_threshold: float):
+    def row_color(row):
+        act = str(row.get("Action_adj", row.get("Action", ""))).lower()
+        if "enter" in act:
+            return ["background-color: #E6F4EA"] * len(row)
+        if "exit" in act:
+            return ["background-color: #FDECEC"] * len(row)
+        if float(row.get(prob_col, 0.0)) >= entry_threshold:
+            return ["background-color: #F6F0DE"] * len(row)
+        return [""] * len(row)
 
-        rt_df["Entry Date"] = pd.to_datetime(rt_df["Entry Date"])
-        rt_df["Exit Date"]  = pd.to_datetime(rt_df["Exit Date"])
-        for c in [
-            "Entry Prob", "Exit Prob", "Return (%)", "PnL Net (€)", "Fees (€)", "Hold (days)"
-        ]:
-            if c not in rt_df.columns:
-                rt_df[c] = np.nan
+    fmt = {
+        prob_col: "{:.4f}",
+        "Close": "{:.2f}",
+        "Target_5d": "{:.2%}",
+    }
+    cols = [c for c in df.columns if c in fmt]
+    return df.style.format({k: v for k, v in fmt.items() if k in cols}).apply(row_color, axis=1)
 
-        r_min_d = rt_df["Entry Date"].min().date()
-        r_max_d = rt_df["Entry Date"].max().date()
-        r_ticks = sorted(rt_df["Ticker"].unique().tolist())
 
-        def finite_minmax(series, fallback=(0.0, 1.0)):
-            s  = pd.to_numeric(series, errors="coerce")
-            lo = float(np.nanmin(s.values))
-            hi = float(np.nanmax(s.values))
-            if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
-                lo, hi = fallback
-            return lo, hi
+def main() -> None:
+    render_header()
+    cfg = render_sidebar()
 
-        r1, r2, r3 = st.columns([1.1, 1.1, 1.5])
-        with r1:
-            rt_tick_sel = st.multiselect(
-                "Ticker (Round-Trips)", options=r_ticks, default=r_ticks
-            )
-            hd_min = int(np.nanmin(rt_df["Hold (days)"].values))
-            hd_max = int(np.nanmax(rt_df["Hold (days)"].values))
-            if not np.isfinite(hd_min): hd_min = 0
-            if not np.isfinite(hd_max): hd_max = 60
-            rt_hold = st.slider(
-                "Haltedauer (Tage)",
-                min_value=hd_min, max_value=hd_max,
-                value=(hd_min, hd_max), step=1, key="rt_hold",
-            )
-        with r2:
-            rt_date = st.date_input(
-                "Zeitraum (Entry-Datum)",
-                value=(r_min_d, r_max_d),
-                min_value=r_min_d, max_value=r_max_d,
-                key="rt_date",
-            )
-            ep_lo, ep_hi = finite_minmax(rt_df["Entry Prob"], (0.0, 1.0))
-            xp_lo, xp_hi = finite_minmax(rt_df["Exit Prob"],  (0.0, 1.0))
-            rt_ep = st.slider("Entry-Prob.", 0.0, 1.0, (max(0.0, ep_lo), min(1.0, ep_hi)), step=0.01)
-            rt_xp = st.slider("Exit-Prob.",  0.0, 1.0, (max(0.0, xp_lo), min(1.0, xp_hi)), step=0.01)
-        with r3:
-            ret_lo, ret_hi = finite_minmax(rt_df["Return (%)"],  (-100.0, 200.0))
-            pnl_lo, pnl_hi = finite_minmax(rt_df["PnL Net (€)"], (-INIT_CAP, INIT_CAP))
-            rt_ret = st.slider(
-                "Return (%)", float(ret_lo), float(ret_hi),
-                (float(ret_lo), float(ret_hi)), step=0.5,
-            )
-            rt_pnl = st.slider(
-                "PnL Net (€)", float(pnl_lo), float(pnl_hi),
-                (float(pnl_lo), float(pnl_hi)), step=10.0,
-            )
-
-        rds, rde = (
-            rt_date if isinstance(rt_date, tuple) else (r_min_d, r_max_d)
-        )
-        mask_rt = (
-            rt_df["Ticker"].isin(rt_tick_sel)
-            & (rt_df["Entry Date"].dt.date.between(rds, rde))
-            & (rt_df["Hold (days)"].fillna(-1).between(rt_hold[0], rt_hold[1]))
-            & (rt_df["Entry Prob"].fillna(0.0).between(rt_ep[0], rt_ep[1]))
-            & (rt_df["Exit Prob"].fillna(0.0).between(rt_xp[0], rt_xp[1]))
-            & (
-                pd.to_numeric(rt_df["Return (%)"], errors="coerce")
-                .fillna(-9e9).between(rt_ret[0], rt_ret[1])
-            )
-            & (
-                pd.to_numeric(rt_df["PnL Net (€)"], errors="coerce")
-                .fillna(-9e9).between(rt_pnl[0], rt_pnl[1])
-            )
-        )
-        rt_f      = rt_df.loc[mask_rt].copy()
-        rt_f_disp = rt_f.copy()
-        rt_f_disp["Entry Date"] = rt_f_disp["Entry Date"].dt.strftime("%Y-%m-%d")
-        rt_f_disp["Exit Date"]  = rt_f_disp["Exit Date"].dt.strftime("%Y-%m-%d")
-        if "Hold (days)" in rt_f_disp.columns:
-            rt_f_disp["Hold (days)"] = rt_f_disp["Hold (days)"].round().astype("Int64")
-
-        fmt_rt = {
-            "Shares":       "{:.4f}",
-            "Entry Price":  "{:.2f}",
-            "Exit Price":   "{:.2f}",
-            "PnL Net (€)":  "{:.2f}",
-            "Fees (€)":     "{:.2f}",
-            "Return (%)":   "{:.2f}",
-            "Entry Prob":   "{:.4f}",
-            "Exit Prob":    "{:.4f}",
-        }
-        if "PosFrac" in rt_f_disp.columns:
-            fmt_rt["PosFrac"] = "{:.4f}"
-
-        styled_rt = rt_f_disp.style.format(fmt_rt)
-        show_styled_or_plain(rt_f_disp, styled_rt)
-        st.download_button(
-            "Round-Trips (gefiltert) als CSV",
-            to_csv_eu(rt_f_disp),
-            file_name="round_trips_filtered.csv",
-            mime="text/csv",
-        )
-
-        # Histogramme
-        st.markdown("### 📊 Verteilung der Round-Trip-Ergebnisse")
-        bins = st.slider("Anzahl Bins", 10, 100, 30, step=5, key="rt_bins")
-
-        ret = pd.to_numeric(rt_f.get("Return (%)"),  errors="coerce").dropna()
-        pnl = pd.to_numeric(rt_f.get("PnL Net (€)"), errors="coerce").dropna()
-
-        def pct(x):
-            return f"{x:.2f}%"
-
-        cstats = st.columns(5)
-        cstats[0].metric("Anzahl",   f"{len(ret)}")
-        cstats[1].metric("Winrate",  pct(100.0 * (ret > 0).mean()) if len(ret) else "–")
-        cstats[2].metric("Ø Return", pct(ret.mean())   if len(ret) else "–")
-        cstats[3].metric("Median",   pct(ret.median()) if len(ret) else "–")
-        cstats[4].metric("Std-Abw.", pct(ret.std())    if len(ret) else "–")
-
-        col_h1, col_h2 = st.columns(2)
-        with col_h1:
-            if ret.empty:
-                st.info("Keine Rendite-Werte vorhanden.")
-            else:
-                fig_ret = go.Figure(go.Histogram(
-                    x=ret, nbinsx=bins, marker_line_width=0
-                ))
-                fig_ret.add_vline(x=0,              line_dash="dash", opacity=0.5)
-                fig_ret.add_vline(x=float(ret.mean()), line_dash="dot", opacity=0.9)
-                fig_ret.update_layout(
-                    title="Histogramm: Return (%)",
-                    xaxis_title="Return (%)", yaxis_title="Häufigkeit",
-                    height=360, margin=dict(t=40, l=40, r=20, b=40),
-                    showlegend=False,
-                )
-                st.plotly_chart(fig_ret, use_container_width=True)
-        with col_h2:
-            if pnl.empty:
-                st.info("Keine PnL-Werte vorhanden.")
-            else:
-                fig_pnl = go.Figure(go.Histogram(
-                    x=pnl, nbinsx=bins, marker_line_width=0
-                ))
-                fig_pnl.add_vline(x=0,              line_dash="dash", opacity=0.5)
-                fig_pnl.add_vline(x=float(pnl.mean()), line_dash="dot", opacity=0.9)
-                fig_pnl.update_layout(
-                    title="Histogramm: PnL Net (€)",
-                    xaxis_title="PnL Net (€)", yaxis_title="Häufigkeit",
-                    height=360, margin=dict(t=40, l=40, r=20, b=40),
-                    showlegend=False,
-                )
-                st.plotly_chart(fig_pnl, use_container_width=True)
-
-        # Korrelation
-        st.markdown("### 🔗 Portfolio-Korrelation (Close-Returns)")
-        c1, c2, c3, c4 = st.columns([1.2, 1.0, 1.2, 1.0])
-        with c1:
-            corr_freq = st.selectbox(
-                "Return-Frequenz",
-                ["täglich", "wöchentlich", "monatlich"],
-                index=0, key="corr_freq",
-            )
-        with c2:
-            corr_method = st.selectbox(
-                "Korrelationsmethode",
-                ["Pearson", "Spearman", "Kendall"],
-                index=0, key="corr_method",
-            )
-        with c3:
-            min_obs = st.slider(
-                "Min. gemeinsame Zeitpunkte", 3, 60, 20, step=1, key="corr_min_obs"
-            )
-        with c4:
-            use_ffill_corr = st.checkbox(
-                "Lücken per FFill schließen", value=True, key="corr_ffill"
-            )
-
-        price_series = []
-        for tk, dfbt in all_dfs.items():
-            if isinstance(dfbt, pd.DataFrame) and "Close" in dfbt.columns and len(dfbt) >= 2:
-                s      = dfbt["Close"].copy()
-                s.name = tk
-                price_series.append(s)
-
-        corr = None
-        if len(price_series) < 2:
-            st.info("Mindestens zwei Ticker mit Daten nötig.")
-        else:
-            prices = pd.concat(price_series, axis=1, join="outer").sort_index()
-            if use_ffill_corr:
-                prices = prices.ffill()
-            if corr_freq == "wöchentlich":
-                prices = prices.resample("W-FRI").last()
-            elif corr_freq == "monatlich":
-                prices = prices.resample("ME").last()
-
-            rets        = prices.pct_change().dropna(how="all")
-            enough      = [c for c in rets.columns if rets[c].count() >= min_obs]
-            rets        = rets[enough]
-            common_rows = rets.dropna(how="any")
-
-            if rets.shape[1] < 2 or len(common_rows) < min_obs:
-                st.info("Zu wenige Datenüberschneidungen für eine Korrelationsmatrix.")
-            else:
-                corr = rets.corr(method=corr_method.lower(), min_periods=min_obs)
-                fig_corr = px.imshow(
-                    corr, text_auto=".2f", aspect="auto",
-                    color_continuous_scale="RdBu", zmin=-1, zmax=1,
-                )
-                fig_corr.update_layout(
-                    height=560, margin=dict(t=40, l=40, r=30, b=40),
-                    coloraxis_colorbar=dict(title="ρ"),
-                )
-                st.plotly_chart(fig_corr, use_container_width=True)
-                st.caption(
-                    f"Basis: {len(common_rows)} gemeinsame Zeitpunkte "
-                    f"· Frequenz: {corr_freq} · Methode: {corr_method}"
-                )
-
-        if corr is not None and corr.shape[0] >= 2:
-            N         = corr.shape[0]
-            tri_vals  = corr.where(~np.eye(N, dtype=bool)).stack()
-            avg_pair  = float(tri_vals.mean())
-            med_pair  = float(tri_vals.median())
-            std_pair  = float(tri_vals.std())
-            w         = np.full(N, 1.0 / N)
-            ip_raw    = float(w @ corr.values @ w)
-            ip_norm   = float((ip_raw - 1.0 / N) / (1.0 - 1.0 / N))
-            mc1, mc2, mc3, mc4 = st.columns(4)
-            mc1.metric("Ø Paar-Korrelation",              f"{avg_pair:.2f}")
-            mc2.metric("Median",                          f"{med_pair:.2f}")
-            mc3.metric("Streuung (σ)",                    f"{std_pair:.2f}")
-            mc4.metric("Portfolio-Korrelation (normiert)", f"{ip_norm:.2f}")
-            st.caption(
-                f"IPC roh={ip_raw:.3f} · normiert={ip_norm:.3f} "
-                f"· N={N} · Methode: {corr_method}"
-            )
-
-else:
-    st.warning(
-        "Noch keine Ergebnisse verfügbar. "
-        "Prüfe Ticker-Eingaben und Datenabdeckung."
+    price_map, meta_map = load_all_prices(
+        tickers=cfg["tickers"],
+        start=str(cfg["start_date"]),
+        end=str(cfg["end_date"]),
+        use_tail=cfg["use_live"],
+        interval=cfg["intraday_interval"],
+        fallback_last=cfg["fallback_last_session"],
+        exec_key=cfg["exec_mode"],
+        moc_cutoff=cfg["moc_cutoff_min"],
     )
+
+    if not price_map:
+        st.warning("No valid price data loaded.")
+        return
+
+    if cfg["enable_optimizer"]:
+        with st.expander("Optimizer Results", expanded=False):
+            st.caption("Two-stage random search with coarse screening and fine local refinement. Trade count is intentionally excluded from the score.")
+            opt_df, best = run_two_stage_optimizer(
+                price_map=price_map,
+                tickers=cfg["tickers"],
+                coarse_trials=cfg["coarse_trials"],
+                fine_trials=cfg["fine_trials"],
+                top_k=cfg["top_k"],
+                seed=cfg["opt_seed"],
+                base_settings={
+                    "min_hold_days": cfg["min_hold_days"],
+                    "cooldown_days": cfg["cooldown_days"],
+                    "use_vol_sizing": cfg["use_vol_sizing"],
+                    "target_vol_annual": cfg["target_vol_annual"],
+                    "pos_frac": cfg["pos_frac"],
+                    "commission": cfg["commission"],
+                    "slippage_bps": cfg["slippage_bps"],
+                    "init_cap": cfg["init_cap"],
+                    "use_calibration": cfg["use_calibration"],
+                    "calibration_frac": cfg["calibration_frac"],
+                },
+                w_dd=cfg["w_dd"],
+            )
+            if not opt_df.empty:
+                st.dataframe(opt_df.head(20), use_container_width=True)
+                st.download_button(
+                    "Download optimizer CSV",
+                    to_csv_eu(opt_df),
+                    file_name="nexus_optimizer_results.csv",
+                    mime="text/csv",
+                )
+                if best:
+                    st.markdown("**Best parameter set applied below:**")
+                    st.json(best)
+                    cfg["lookback"] = int(best["lookback"])
+                    cfg["horizon"] = int(best["horizon"])
+                    cfg["threshold"] = float(best["threshold"])
+                    cfg["entry_prob"] = float(best["entry_prob"])
+                    cfg["exit_prob"] = float(best["exit_prob"])
+                    cfg["wf_stride"] = int(best["wf_stride"])
+                    cfg["model_params"] = {
+                        "max_iter": int(best["max_iter"]),
+                        "learning_rate": float(best["learning_rate"]),
+                        "max_depth": int(best["max_depth"]),
+                        "min_samples_leaf": int(best["min_samples_leaf"]),
+                        "l2_regularization": float(best["l2_regularization"]),
+                    }
+
+    summaries = []
+    live_rows = []
+    results: Dict[str, Dict[str, Any]] = {}
+
+    for tk in cfg["tickers"]:
+        df = price_map.get(tk)
+        if df is None or len(df) < 120:
+            continue
+        try:
+            feat, bt, trades, summary = make_features_and_backtest(
+                df=df,
+                lookback=cfg["lookback"],
+                horizon=cfg["horizon"],
+                threshold=cfg["threshold"],
+                model_params=cfg["model_params"],
+                entry_prob=cfg["entry_prob"],
+                exit_prob=cfg["exit_prob"],
+                min_hold_days=cfg["min_hold_days"],
+                cooldown_days=cfg["cooldown_days"],
+                walk_forward=cfg["walk_forward"],
+                use_vol_sizing=cfg["use_vol_sizing"],
+                target_vol_annual=cfg["target_vol_annual"],
+                base_pos_frac=cfg["pos_frac"],
+                commission=cfg["commission"],
+                slippage_bps=cfg["slippage_bps"],
+                init_cap=cfg["init_cap"],
+                wf_stride=cfg["wf_stride"],
+                use_calibration=cfg["use_calibration"],
+                calibration_frac=cfg["calibration_frac"],
+            )
+            summaries.append({"Ticker": tk, **summary})
+            live_rows.append(
+                {
+                    "Ticker": tk,
+                    "Close": float(bt["Close"].iloc[-1]),
+                    "SignalProb": float(bt["SignalProb"].iloc[-1]),
+                    "Action": bt["Action"].iloc[-1],
+                    "Action_adj": bt["Action_adj"].iloc[-1],
+                    "Target_5d": float(bt["Target_5d"].iloc[-1]) if np.isfinite(bt["Target_5d"].iloc[-1]) else np.nan,
+                }
+            )
+            results[tk] = {"features": feat, "bt": bt, "trades": pd.DataFrame(trades), "summary": summary, "meta": meta_map.get(tk, {})}
+        except Exception as e:
+            st.error(f"{tk}: {e}")
+
+    if not summaries:
+        st.warning("No ticker could be backtested successfully.")
+        return
+
+    summary_df = pd.DataFrame(summaries).sort_values("Net (%)", ascending=False).reset_index(drop=True)
+    live_df = pd.DataFrame(live_rows).sort_values("SignalProb", ascending=False).reset_index(drop=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Tickers", len(summary_df))
+    c2.metric("Median Net", fmt_num(summary_df["Net (%)"].median()) + "%")
+    c3.metric("Median Sharpe", fmt_num(summary_df["Sharpe"].median()))
+    c4.metric("Median Max DD", fmt_num(summary_df["Max DD (%)"].median()) + "%")
+
+    tab1, tab2, tab3 = st.tabs(["Overview", "Live Board", "Ticker Detail"])
+
+    with tab1:
+        st.markdown('<div class="section-header">Portfolio Summary</div>', unsafe_allow_html=True)
+        st.dataframe(summary_df, use_container_width=True)
+        st.plotly_chart(summary_bar(summary_df), use_container_width=True)
+        st.download_button(
+            "Download summary CSV",
+            to_csv_eu(summary_df),
+            file_name="nexus_summary.csv",
+            mime="text/csv",
+        )
+
+    with tab2:
+        st.markdown('<div class="section-header">Latest Signals</div>', unsafe_allow_html=True)
+        st.dataframe(style_live_board(live_df, "SignalProb", cfg["entry_prob"]), use_container_width=True)
+
+    with tab3:
+        selected = st.selectbox("Ticker", options=list(results.keys()))
+        res = results[selected]
+        bt = res["bt"]
+        trades_df = res["trades"]
+        summary = res["summary"]
+        meta = res["meta"]
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Net (%)", fmt_num(summary["Net (%)"]) + "%")
+        k2.metric("Sharpe", fmt_num(summary["Sharpe"]))
+        k3.metric("Buy & Hold (%)", fmt_num(summary["Buy & Hold (%)"]) + "%")
+        k4.metric("Closed Trades", str(summary["Closed Trades"]))
+
+        if meta.get("tail_is_intraday") and meta.get("tail_ts") is not None:
+            st.caption(f"Last datapoint: {bt.index[-1].strftime('%Y-%m-%d %H:%M %Z')} · intraday tail through {meta['tail_ts'].strftime('%H:%M %Z')}")
+        else:
+            st.caption(f"Last datapoint: {bt.index[-1].strftime('%Y-%m-%d %H:%M %Z')}")
+
+        st.plotly_chart(equity_chart(bt, selected), use_container_width=True)
+        st.plotly_chart(prob_chart(bt, cfg["entry_prob"], cfg["exit_prob"], selected), use_container_width=True)
+        st.dataframe(trades_df, use_container_width=True)
+        if not trades_df.empty:
+            st.download_button(
+                "Download trades CSV",
+                to_csv_eu(trades_df),
+                file_name=f"{selected}_trades.csv",
+                mime="text/csv",
+            )
+
+
+if __name__ == "__main__":
+    main()
