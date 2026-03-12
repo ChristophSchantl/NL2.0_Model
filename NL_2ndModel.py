@@ -61,6 +61,16 @@ BASE_FEATURE_COLS = [
     "Vol_ratio",
 ]
 
+TRADE_COLS = [
+    "Typ",
+    "Date",
+    "Price",
+    "PnL_%",
+    "Held_Days",
+    "Probability",
+    "PosFrac",
+]
+
 st.markdown(
     f"""
 <style>
@@ -378,6 +388,7 @@ def load_all_prices(
             finally:
                 done += 1
                 prog.progress(done / total)
+    prog.empty()
     return price_map, meta_map
 
 
@@ -502,6 +513,8 @@ def make_features_and_backtest(
         raise ValueError("Zu wenige Datenpunkte nach Preprocessing für das Modell.")
 
     x_cols = [c for c in BASE_FEATURE_COLS if c in hist.columns]
+    if not x_cols:
+        raise ValueError("Keine gültigen Features nach Preprocessing vorhanden.")
     X_all = feat[x_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy(dtype=np.float32)
     future_ret = feat["FutureRet"].to_numpy(dtype=np.float32)
     probs = np.full(len(feat), np.nan, dtype=np.float32)
@@ -652,15 +665,7 @@ def make_features_and_backtest(
     bt["Equity_Net"] = np.array(equity_net, dtype=np.float64)
     bt["StrategyRet"] = bt["Equity_Net"].pct_change().fillna(0.0)
 
-    trade_cols = ["Typ", "Date", "Price", "PnL_%", "Held_Days", "Probability", "PosFrac"]
-    trades_df = pd.DataFrame(trades)
-    if trades_df.empty:
-        trades_df = pd.DataFrame(columns=trade_cols)
-    else:
-        for col in trade_cols:
-            if col not in trades_df.columns:
-                trades_df[col] = np.nan
-        trades_df = trades_df[trade_cols]
+    trades_df = ensure_trade_frame(trades)
 
     bh_ret = bt["Close"].iloc[-1] / bt["Close"].iloc[0] - 1.0
     net_ret = bt["Equity_Net"].iloc[-1] / bt["Equity_Net"].iloc[0] - 1.0
@@ -668,7 +673,8 @@ def make_features_and_backtest(
     cagr = cagr_from_equity(bt["Equity_Net"])
     sharpe = sharpe_from_returns(bt["StrategyRet"])
 
-    closed_trades = trades_df.loc[trades_df["Typ"].eq("Exit")].copy()
+    closed_mask = trades_df["Typ"].eq("Exit") if "Typ" in trades_df.columns else pd.Series(False, index=trades_df.index)
+    closed_trades = trades_df.loc[closed_mask].copy()
     winrate = float((closed_trades["PnL_%"] > 0).mean()) if len(closed_trades) else np.nan
 
     summary = {
@@ -1152,16 +1158,18 @@ def main() -> None:
                     "Target_5d": float(bt["Target_5d"].iloc[-1]) if np.isfinite(bt["Target_5d"].iloc[-1]) else np.nan,
                 }
             )
-            results[tk] = {"features": feat, "bt": bt, "trades": pd.DataFrame(trades), "summary": summary, "meta": meta_map.get(tk, {})}
+            results[tk] = {"features": feat, "bt": bt, "trades": ensure_trade_frame(trades), "summary": summary, "meta": meta_map.get(tk, {})}
         except Exception as e:
-            st.error(f"{tk}: {e}")
+            st.error(f"{tk}: {type(e).__name__}: {e}")
 
     if not summaries:
         st.warning("No ticker could be backtested successfully.")
         return
 
-    summary_df = pd.DataFrame(summaries).sort_values("Net (%)", ascending=False).reset_index(drop=True)
-    live_df = pd.DataFrame(live_rows).sort_values("SignalProb", ascending=False).reset_index(drop=True)
+    summary_df = pd.DataFrame(summaries)
+    summary_df = summary_df.sort_values("Net (%)", ascending=False, na_position="last").reset_index(drop=True)
+    live_df = pd.DataFrame(live_rows)
+    live_df = live_df.sort_values("SignalProb", ascending=False, na_position="last").reset_index(drop=True)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Tickers", len(summary_df))
@@ -1207,7 +1215,10 @@ def main() -> None:
 
         st.plotly_chart(equity_chart(bt, selected), use_container_width=True)
         st.plotly_chart(prob_chart(bt, cfg["entry_prob"], cfg["exit_prob"], selected), use_container_width=True)
-        st.dataframe(trades_df, use_container_width=True)
+        if trades_df.empty:
+            st.info("Keine geschlossenen oder offenen Trades für den gewählten Zeitraum.")
+        else:
+            st.dataframe(trades_df, use_container_width=True)
         if not trades_df.empty:
             st.download_button(
                 "Download trades CSV",
