@@ -652,7 +652,15 @@ def make_features_and_backtest(
     bt["Equity_Net"] = np.array(equity_net, dtype=np.float64)
     bt["StrategyRet"] = bt["Equity_Net"].pct_change().fillna(0.0)
 
+    trade_cols = ["Typ", "Date", "Price", "PnL_%", "Held_Days", "Probability", "PosFrac"]
     trades_df = pd.DataFrame(trades)
+    if trades_df.empty:
+        trades_df = pd.DataFrame(columns=trade_cols)
+    else:
+        for col in trade_cols:
+            if col not in trades_df.columns:
+                trades_df[col] = np.nan
+        trades_df = trades_df[trade_cols]
 
     bh_ret = bt["Close"].iloc[-1] / bt["Close"].iloc[0] - 1.0
     net_ret = bt["Equity_Net"].iloc[-1] / bt["Equity_Net"].iloc[0] - 1.0
@@ -660,7 +668,7 @@ def make_features_and_backtest(
     cagr = cagr_from_equity(bt["Equity_Net"])
     sharpe = sharpe_from_returns(bt["StrategyRet"])
 
-    closed_trades = trades_df[trades_df["Typ"] == "Exit"].copy()
+    closed_trades = trades_df.loc[trades_df["Typ"].eq("Exit")].copy()
     winrate = float((closed_trades["PnL_%"] > 0).mean()) if len(closed_trades) else np.nan
 
     summary = {
