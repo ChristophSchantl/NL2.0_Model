@@ -1,7 +1,13 @@
 # streamlit_app_v2.py
 # ─────────────────────────────────────────────────────────────
-# NEXT LEVEL 2ND MODELL – Signal-basierte Strategie v2
+# NEXUS 2ND AI MODEL – Signal-basierte Strategie v2.1
 # pro Ticker separates Konto · Portfolio Forecast (MC) · Walk-Forward
+# Changelog v2.1:
+#   - Options-Modul entfernt (PCR/VOI/IV)
+#   - Intraday: 10 Trading-Tage, Linienchart, keine Wochenend-/Nacht-Lücken
+#   - Exog-Feature-Pipeline vereinfacht
+#   - ThreadPoolExecutor für Intraday-Prefetch
+#   - get_ticker_name gecacht mit separatem Cache-Key
 # ─────────────────────────────────────────────────────────────
 
 import warnings
@@ -32,10 +38,10 @@ THEME = {
     "bg":         "#F7F8FA",
     "bg_card":    "#FFFFFF",
     "bg_panel":   "#F1F4F8",
-    "accent1":    "#C8A96B",   # warm gold
-    "accent2":    "#D97706",   # amber
-    "accent3":    "#2563EB",   # blue
-    "accent4":    "#7C3AED",   # violet
+    "accent1":    "#C8A96B",
+    "accent2":    "#D97706",
+    "accent3":    "#2563EB",
+    "accent4":    "#7C3AED",
     "red":        "#DC2626",
     "green":      "#16A34A",
     "text":       "#111827",
@@ -47,50 +53,29 @@ THEME = {
 PLOTLY_BASE = dict(
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="#FFFFFF",
-    font=dict(
-        family="'Inter', 'Segoe UI', sans-serif",
-        color=THEME["text"],
-        size=12
-    ),
+    font=dict(family="'Inter', 'Segoe UI', sans-serif", color=THEME["text"], size=12),
     xaxis=dict(
-        gridcolor=THEME["grid"],
-        gridwidth=1,
-        showline=True,
-        linecolor=THEME["border"],
-        zeroline=False,
+        gridcolor=THEME["grid"], gridwidth=1, showline=True,
+        linecolor=THEME["border"], zeroline=False,
         tickfont=dict(size=11, color=THEME["muted"]),
         title_font=dict(size=12, color=THEME["muted"]),
     ),
     yaxis=dict(
-        gridcolor=THEME["grid"],
-        gridwidth=1,
-        showline=True,
-        linecolor=THEME["border"],
-        zeroline=False,
+        gridcolor=THEME["grid"], gridwidth=1, showline=True,
+        linecolor=THEME["border"], zeroline=False,
         tickfont=dict(size=11, color=THEME["muted"]),
         title_font=dict(size=12, color=THEME["muted"]),
     ),
     hoverlabel=dict(
-        bgcolor="#FFFFFF",
-        font_color=THEME["text"],
-        font_family="'Inter', sans-serif",
-        bordercolor=THEME["border"],
+        bgcolor="#FFFFFF", font_color=THEME["text"],
+        font_family="'Inter', sans-serif", bordercolor=THEME["border"],
     ),
     margin=dict(t=56, b=44, l=58, r=20),
     legend=dict(
-        bgcolor="rgba(255,255,255,0)",
-        font=dict(size=11, color=THEME["muted"]),
-        orientation="h",
-        yanchor="bottom",
-        y=1.02,
-        xanchor="right",
-        x=1,
+        bgcolor="rgba(255,255,255,0)", font=dict(size=11, color=THEME["muted"]),
+        orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
     ),
-    modebar=dict(
-        bgcolor="rgba(255,255,255,0)",
-        color=THEME["muted"],
-        activecolor=THEME["accent1"]
-    ),
+    modebar=dict(bgcolor="rgba(255,255,255,0)", color=THEME["muted"], activecolor=THEME["accent1"]),
 )
 
 st.set_page_config(
@@ -112,287 +97,74 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Playfair+Display:wght@600;700&display=swap');
 
 :root {
-  --bg: #F7F8FA;
-  --bg-card: #FFFFFF;
-  --bg-panel: #F1F4F8;
-  --primary: #C8A96B;
-  --primary-dark: #B28A45;
-  --secondary: #2563EB;
-  --violet: #7C3AED;
-  --green: #16A34A;
-  --red: #DC2626;
-  --text: #111827;
-  --muted: #6B7280;
-  --border: #E5E7EB;
-  --grid: #EAECEF;
-  --shadow: 0 6px 22px rgba(17, 24, 39, 0.06);
-  --radius: 18px;
+  --bg: #F7F8FA; --bg-card: #FFFFFF; --bg-panel: #F1F4F8;
+  --primary: #C8A96B; --primary-dark: #B28A45;
+  --secondary: #2563EB; --violet: #7C3AED;
+  --green: #16A34A; --red: #DC2626;
+  --text: #111827; --muted: #6B7280; --border: #E5E7EB; --grid: #EAECEF;
+  --shadow: 0 6px 22px rgba(17,24,39,0.06); --radius: 18px;
 }
-
-html, body, [class*="css"] {
-  background-color: var(--bg) !important;
-  color: var(--text) !important;
-  font-family: 'Inter', sans-serif !important;
+html, body, [class*="css"] { background-color: var(--bg) !important; color: var(--text) !important; font-family: 'Inter', sans-serif !important; }
+.stApp { background: linear-gradient(180deg, #FAFBFC 0%, #F5F7FA 100%) !important; color: var(--text) !important; }
+.block-container { padding-top: 2rem !important; padding-bottom: 2rem !important; max-width: 1500px !important; }
+[data-testid="stSidebar"] { background: #FFFFFF !important; border-right: 1px solid var(--border) !important; }
+[data-testid="stSidebar"] * { color: var(--text) !important; }
+[data-testid="stSidebar"] label { font-size: 12px !important; color: var(--muted) !important; font-weight: 600 !important; }
+div[data-baseweb="select"] > div, .stTextInput > div > div > input,
+.stNumberInput input, .stDateInput input, textarea {
+  background: #FFFFFF !important; border: 1px solid var(--border) !important;
+  border-radius: 12px !important; color: var(--text) !important; box-shadow: none !important;
 }
-
-.stApp {
-  background: linear-gradient(180deg, #FAFBFC 0%, #F5F7FA 100%) !important;
-  color: var(--text) !important;
+div[data-baseweb="select"] > div:focus-within, .stTextInput > div > div > input:focus,
+.stNumberInput input:focus, .stDateInput input:focus, textarea:focus {
+  border-color: var(--primary) !important; box-shadow: 0 0 0 3px rgba(200,169,107,0.15) !important;
 }
-
-.block-container {
-  padding-top: 2rem !important;
-  padding-bottom: 2rem !important;
-  max-width: 1500px !important;
+.stButton > button, .stDownloadButton > button {
+  border-radius: 12px !important; border: 1px solid var(--border) !important;
+  background: #FFFFFF !important; color: var(--text) !important;
+  font-weight: 600 !important; padding: 0.58rem 1rem !important;
+  transition: all 0.18s ease !important; box-shadow: none !important;
 }
-
-/* Sidebar */
-[data-testid="stSidebar"] {
-  background: #FFFFFF !important;
-  border-right: 1px solid var(--border) !important;
+.stButton > button:hover, .stDownloadButton > button:hover {
+  border-color: var(--primary) !important; color: var(--primary-dark) !important; transform: translateY(-1px);
 }
-[data-testid="stSidebar"] * {
-  color: var(--text) !important;
-}
-[data-testid="stSidebar"] label {
-  font-size: 12px !important;
-  color: var(--muted) !important;
-  font-weight: 600 !important;
-}
-[data-testid="stSidebar"] .stSelectbox,
-[data-testid="stSidebar"] .stMultiSelect,
-[data-testid="stSidebar"] .stNumberInput,
-[data-testid="stSidebar"] .stTextInput,
-[data-testid="stSidebar"] .stDateInput {
-  background: transparent !important;
-}
-
-/* Inputs */
-div[data-baseweb="select"] > div,
-.stTextInput > div > div > input,
-.stNumberInput input,
-.stDateInput input,
-textarea {
-  background: #FFFFFF !important;
-  border: 1px solid var(--border) !important;
-  border-radius: 12px !important;
-  color: var(--text) !important;
-  box-shadow: none !important;
-}
-div[data-baseweb="select"] > div:hover,
-.stTextInput > div > div > input:hover,
-.stNumberInput input:hover,
-.stDateInput input:hover,
-textarea:hover {
-  border-color: #D1D5DB !important;
-}
-div[data-baseweb="select"] > div:focus-within,
-.stTextInput > div > div > input:focus,
-.stNumberInput input:focus,
-.stDateInput input:focus,
-textarea:focus {
-  border-color: var(--primary) !important;
-  box-shadow: 0 0 0 3px rgba(200,169,107,0.15) !important;
-}
-
-/* Buttons */
-.stButton > button,
-.stDownloadButton > button {
-  border-radius: 12px !important;
-  border: 1px solid var(--border) !important;
-  background: #FFFFFF !important;
-  color: var(--text) !important;
-  font-weight: 600 !important;
-  padding: 0.58rem 1rem !important;
-  transition: all 0.18s ease !important;
-  box-shadow: none !important;
-}
-.stButton > button:hover,
-.stDownloadButton > button:hover {
-  border-color: var(--primary) !important;
-  color: var(--primary-dark) !important;
-  transform: translateY(-1px);
-}
-.stButton > button[kind="primary"],
-.stButton > button[data-testid*="primary"] {
+.stButton > button[kind="primary"] {
   background: linear-gradient(135deg, #C8A96B 0%, #B28A45 100%) !important;
-  color: white !important;
-  border: none !important;
-  box-shadow: 0 8px 18px rgba(200,169,107,0.22) !important;
+  color: white !important; border: none !important; box-shadow: 0 8px 18px rgba(200,169,107,0.22) !important;
 }
-.stButton > button[kind="primary"]:hover,
-.stButton > button[data-testid*="primary"]:hover {
-  filter: brightness(1.02);
-}
-
-/* Metrics */
 [data-testid="metric-container"] {
-  background: var(--bg-card) !important;
-  border: 1px solid var(--border) !important;
-  border-radius: 18px !important;
-  padding: 18px 18px !important;
-  box-shadow: var(--shadow) !important;
+  background: var(--bg-card) !important; border: 1px solid var(--border) !important;
+  border-radius: 18px !important; padding: 18px 18px !important; box-shadow: var(--shadow) !important;
 }
-[data-testid="metric-container"] label {
-  color: var(--muted) !important;
-  font-size: 12px !important;
-  font-weight: 600 !important;
-}
-[data-testid="metric-container"] [data-testid="stMetricValue"] {
-  color: var(--text) !important;
-  font-size: 24px !important;
-  font-weight: 750 !important;
-}
-
-/* Expanders */
-details {
-  background: #FFFFFF !important;
-  border: 1px solid var(--border) !important;
-  border-radius: 18px !important;
-  margin-bottom: 14px !important;
-  box-shadow: var(--shadow) !important;
-}
-details summary {
-  font-size: 14px !important;
-  font-weight: 700 !important;
-  color: var(--text) !important;
-  padding: 14px 18px !important;
-}
-details[open] summary {
-  border-bottom: 1px solid #F3F4F6 !important;
-}
-
-/* Tables */
-.stDataFrame, .stTable {
-  border: 1px solid var(--border) !important;
-  border-radius: 18px !important;
-  overflow: hidden !important;
-  background: #FFFFFF !important;
-  box-shadow: var(--shadow) !important;
-}
-.stDataFrame thead th {
-  background: #F9FAFB !important;
-  color: var(--muted) !important;
-  font-size: 12px !important;
-  font-weight: 700 !important;
-  border-bottom: 1px solid var(--border) !important;
-}
-.stDataFrame tbody td {
-  color: var(--text) !important;
-  font-size: 12px !important;
-}
-.stDataFrame tbody tr:hover {
-  background: rgba(200,169,107,0.06) !important;
-}
-
-/* Alerts */
-.stAlert {
-  border-radius: 16px !important;
-  border: 1px solid var(--border) !important;
-}
-
-/* Tabs */
-.stTabs [data-baseweb="tab-list"] {
-  gap: 8px;
-  border-bottom: 1px solid var(--border) !important;
-}
-.stTabs [data-baseweb="tab"] {
-  background: transparent !important;
-  color: var(--muted) !important;
-  border-radius: 10px 10px 0 0 !important;
-  padding: 10px 14px !important;
-  font-weight: 600 !important;
-}
-.stTabs [aria-selected="true"] {
-  color: var(--text) !important;
-  border-bottom: 2px solid var(--primary) !important;
-}
-
-/* Progress */
-.stProgress > div > div {
-  background: linear-gradient(90deg, #C8A96B 0%, #B28A45 100%) !important;
-}
-
-.nexus-header {
-  font-family: 'Playfair Display', serif !important;
-  font-weight: 700 !important;
-  font-size: 40px !important;
-  color: var(--text) !important;
-  letter-spacing: -0.02em;
-  line-height: 1.0;
-}
-.nexus-sub {
-  font-family: 'Inter', sans-serif !important;
-  font-size: 13px !important;
-  color: var(--muted) !important;
-  font-weight: 500 !important;
-  margin-top: 8px;
-}
-
-.section-bar {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 8px 0 14px 0;
-  margin: 28px 0 16px 0;
-}
-.section-bar-label {
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.10em;
-  text-transform: uppercase;
-  color: var(--muted);
-}
-.section-bar-line {
-  flex: 1;
-  height: 1px;
-  background: var(--border);
-}
-.section-bar-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 999px;
-  background: linear-gradient(135deg, #C8A96B 0%, #B28A45 100%);
-  box-shadow: 0 0 0 4px rgba(200,169,107,0.12);
-}
-
-.kpi-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 14px;
-  margin: 16px 0 20px 0;
-}
-.kpi-box {
-  background: #FFFFFF;
-  border: 1px solid var(--border);
-  border-radius: 18px;
-  padding: 16px 16px;
-  box-shadow: var(--shadow);
-}
-.kpi-label {
-  font-size: 11px;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  font-weight: 700;
-  margin-bottom: 8px;
-}
-.kpi-value {
-  font-size: 22px;
-  font-weight: 750;
-  color: var(--text);
-}
+[data-testid="metric-container"] label { color: var(--muted) !important; font-size: 12px !important; font-weight: 600 !important; }
+[data-testid="metric-container"] [data-testid="stMetricValue"] { color: var(--text) !important; font-size: 24px !important; font-weight: 750 !important; }
+details { background: #FFFFFF !important; border: 1px solid var(--border) !important; border-radius: 18px !important; margin-bottom: 14px !important; box-shadow: var(--shadow) !important; }
+details summary { font-size: 14px !important; font-weight: 700 !important; color: var(--text) !important; padding: 14px 18px !important; }
+details[open] summary { border-bottom: 1px solid #F3F4F6 !important; }
+.stDataFrame, .stTable { border: 1px solid var(--border) !important; border-radius: 18px !important; overflow: hidden !important; background: #FFFFFF !important; box-shadow: var(--shadow) !important; }
+.stDataFrame thead th { background: #F9FAFB !important; color: var(--muted) !important; font-size: 12px !important; font-weight: 700 !important; border-bottom: 1px solid var(--border) !important; }
+.stDataFrame tbody td { color: var(--text) !important; font-size: 12px !important; }
+.stDataFrame tbody tr:hover { background: rgba(200,169,107,0.06) !important; }
+.stAlert { border-radius: 16px !important; border: 1px solid var(--border) !important; }
+.stTabs [data-baseweb="tab-list"] { gap: 8px; border-bottom: 1px solid var(--border) !important; }
+.stTabs [data-baseweb="tab"] { background: transparent !important; color: var(--muted) !important; border-radius: 10px 10px 0 0 !important; padding: 10px 14px !important; font-weight: 600 !important; }
+.stTabs [aria-selected="true"] { color: var(--text) !important; border-bottom: 2px solid var(--primary) !important; }
+.stProgress > div > div { background: linear-gradient(90deg, #C8A96B 0%, #B28A45 100%) !important; }
+.nexus-header { font-family: 'Playfair Display', serif !important; font-weight: 700 !important; font-size: 40px !important; color: var(--text) !important; letter-spacing: -0.02em; line-height: 1.0; }
+.nexus-sub { font-family: 'Inter', sans-serif !important; font-size: 13px !important; color: var(--muted) !important; font-weight: 500 !important; margin-top: 8px; }
+.section-bar { display: flex; align-items: center; gap: 12px; padding: 8px 0 14px 0; margin: 28px 0 16px 0; }
+.section-bar-label { font-size: 12px; font-weight: 700; letter-spacing: 0.10em; text-transform: uppercase; color: var(--muted); }
+.section-bar-line { flex: 1; height: 1px; background: var(--border); }
+.section-bar-dot { width: 10px; height: 10px; border-radius: 999px; background: linear-gradient(135deg, #C8A96B 0%, #B28A45 100%); box-shadow: 0 0 0 4px rgba(200,169,107,0.12); }
+.kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin: 16px 0 20px 0; }
+.kpi-box { background: #FFFFFF; border: 1px solid var(--border); border-radius: 18px; padding: 16px 16px; box-shadow: var(--shadow); }
+.kpi-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 700; margin-bottom: 8px; }
+.kpi-value { font-size: 22px; font-weight: 750; color: var(--text); }
 .kpi-pos .kpi-value { color: var(--green); }
 .kpi-neg .kpi-value { color: var(--red); }
 .kpi-info .kpi-value { color: var(--secondary); }
 .kpi-warn .kpi-value { color: var(--primary-dark); }
-
-.stCaption, .stMarkdown p {
-  color: var(--text);
-}
-hr {
-  border-color: var(--border) !important;
-}
+hr { border-color: var(--border) !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -401,11 +173,8 @@ hr {
 # ─────────────────────────────────────────────────────────────
 def to_csv_eu(df: pd.DataFrame, float_format: Optional[str] = None) -> bytes:
     return df.to_csv(
-        index=False,
-        sep=";",
-        decimal=",",
-        date_format="%d.%m.%Y",
-        float_format=float_format
+        index=False, sep=";", decimal=",",
+        date_format="%d.%m.%Y", float_format=float_format
     ).encode("utf-8-sig")
 
 def _normalize_tickers(items: List[str]) -> List[str]:
@@ -481,17 +250,12 @@ def _eur(v):
 def _apply_theme(fig: go.Figure, height: int = 420) -> go.Figure:
     fig.update_layout(**PLOTLY_BASE, height=height)
     fig.update_xaxes(
-        showspikes=True,
-        spikecolor=THEME["muted"],
-        spikethickness=1,
-        spikedash="dot",
-        spikemode="across",
+        showspikes=True, spikecolor=THEME["muted"],
+        spikethickness=1, spikedash="dot", spikemode="across",
     )
     fig.update_yaxes(
-        showspikes=True,
-        spikecolor=THEME["muted"],
-        spikethickness=1,
-        spikedash="dot",
+        showspikes=True, spikecolor=THEME["muted"],
+        spikethickness=1, spikedash="dot",
     )
     return fig
 
@@ -503,7 +267,7 @@ with st.sidebar:
     <div style="padding:10px 0 20px;border-bottom:1px solid #E5E7EB;margin-bottom:18px;">
       <div style="font-family:'Playfair Display',serif;font-weight:700;font-size:24px;color:#111827;letter-spacing:-0.02em;">NEXUS</div>
       <div style="font-family:'Inter',sans-serif;font-size:11px;color:#B28A45;letter-spacing:0.12em;margin-top:4px;font-weight:700;">
-        2ND AI MODEL · v2.0
+        2ND AI MODEL · v2.1
       </div>
     </div>
     """, unsafe_allow_html=True)
@@ -542,9 +306,7 @@ with st.sidebar:
     st.download_button(
         "⬇ Ticker-CSV",
         to_csv_eu(pd.DataFrame({"ticker": tickers_final})),
-        file_name="tickers.csv",
-        mime="text/csv",
-        use_container_width=True
+        file_name="tickers.csv", mime="text/csv", use_container_width=True
     )
     TICKERS = tickers_final
 
@@ -585,7 +347,7 @@ with st.sidebar:
     fallback_last_session = st.checkbox("Session Fallback", value=False)
     exec_mode = st.selectbox("Execution", ["Next Open (backtest+live)", "Market-On-Close (live only)"])
     moc_cutoff_min = st.number_input("MOC Cutoff (min)", 5, 60, 15, step=5)
-    intraday_chart_type = st.selectbox("Intraday Chart", ["Candlestick (OHLC)", "Close-Linie"], index=0)
+    INTRADAY_SESSIONS = st.number_input("Intraday Sessions", 3, 20, 10, step=1)
 
     st.divider()
     st.markdown("**ML PARAMS**")
@@ -606,13 +368,6 @@ with st.sidebar:
     wf_min_train = st.number_input("WF min_train Bars", 40, 500, 120, step=10)
 
     st.divider()
-    st.markdown("**OPTIONS DATA**")
-    use_chain_live = st.checkbox("Live Optionskette (PCR/VOI)", value=True)
-    atm_band_pct = st.slider("ATM-Band ±%", 1, 15, 5) / 100.0
-    max_days_to_exp = st.slider("Max. Laufzeit (Tage)", 7, 45, 21)
-    n_expiries = st.slider("Nächste n Verfälle", 1, 4, 2)
-
-    st.divider()
     st.markdown("**PORTFOLIO FORECAST**")
     FORECAST_DAYS = st.number_input("Forecast Horizon (Tage)", 1, 30, 7, step=1)
     MC_SIMS = st.number_input("MC Simulationen", 200, 5000, 1500, step=100)
@@ -630,13 +385,9 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=180)
 def get_price_data_tail_intraday(
-    ticker,
-    years=3,
-    use_tail=True,
-    interval="5m",
+    ticker, years=3, use_tail=True, interval="5m",
     fallback_last_session=False,
-    exec_mode_key="Next Open (backtest+live)",
-    moc_cutoff_min_val=15
+    exec_mode_key="Next Open (backtest+live)", moc_cutoff_min_val=15
 ):
     tk = yf.Ticker(ticker)
     df = tk.history(period=f"{years}y", interval="1d", auto_adjust=True, actions=False)
@@ -666,7 +417,8 @@ def get_price_data_tail_intraday(
         intraday = pd.DataFrame()
 
     if exec_mode_key.startswith("Market-On-Close") and not intraday.empty:
-        intraday = intraday.loc[:datetime.now(LOCAL_TZ) - timedelta(minutes=int(moc_cutoff_min_val))]
+        cutoff = datetime.now(LOCAL_TZ) - timedelta(minutes=int(moc_cutoff_min_val))
+        intraday = intraday.loc[:cutoff]
 
     if intraday.empty and fallback_last_session:
         try:
@@ -702,7 +454,8 @@ def get_price_data_tail_intraday(
     return df, meta
 
 @st.cache_data(show_spinner=False, ttl=180)
-def get_intraday_last_n_sessions(ticker, sessions=5, days_buffer=10, interval="5m"):
+def get_intraday_sessions(ticker: str, sessions: int = 10, days_buffer: int = 20, interval: str = "5m") -> pd.DataFrame:
+    """Fetch intraday data for last N trading sessions (no weekends/gaps)."""
     tk = yf.Ticker(ticker)
     intr = tk.history(period=f"{days_buffer}d", interval=interval, auto_adjust=True, actions=False, prepost=False)
     if intr.empty:
@@ -711,8 +464,11 @@ def get_intraday_last_n_sessions(ticker, sessions=5, days_buffer=10, interval="5
         intr.index = intr.index.tz_localize("UTC")
     intr.index = intr.index.tz_convert(LOCAL_TZ)
     intr = intr.sort_index()
-    keep = set(pd.Index(intr.index.normalize().unique())[-sessions:])
-    return intr.loc[intr.index.normalize().isin(keep)].copy()
+
+    # Keep last N unique trading days
+    trading_days = sorted(intr.index.normalize().unique())
+    keep_days = set(trading_days[-int(sessions):])
+    return intr.loc[intr.index.normalize().isin(keep_days)].copy()
 
 def load_all_prices(tickers, start, end, use_tail, interval, fallback_last, exec_key, moc_cutoff):
     price_map, meta_map = {}, {}
@@ -744,102 +500,29 @@ def load_all_prices(tickers, start, end, use_tail, interval, fallback_last, exec
                     prog.progress(done / len(tickers))
     return price_map, meta_map
 
-# ─────────────────────────────────────────────────────────────
-# Options
-# ─────────────────────────────────────────────────────────────
-def _atm_strike(ref_px, strikes):
-    if not np.isfinite(ref_px) or strikes.size == 0:
-        return np.nan
-    return float(strikes[np.argmin(np.abs(strikes - ref_px))])
-
-def _band_mask(strikes, atm, band):
-    if not np.isfinite(atm):
-        return pd.Series([False] * len(strikes), index=strikes.index)
-    return strikes.between(atm * (1 - band), atm * (1 + band))
-
-@st.cache_data(show_spinner=False, ttl=180)
-def get_equity_chain_aggregates_for_today(ticker, ref_price, atm_band, n_exps, max_days):
-    tk = yf.Ticker(ticker)
-    try:
-        exps = tk.options or []
-    except Exception:
-        exps = []
-    if not exps:
-        return pd.DataFrame()
-
-    today = pd.Timestamp.today(tz=LOCAL_TZ).normalize()
-    exps_filt = sorted(
-        [
-            (pd.Timestamp(e).tz_localize("UTC").tz_convert(LOCAL_TZ).normalize(), e)
-            for e in exps
-            if (pd.Timestamp(e).tz_localize("UTC").tz_convert(LOCAL_TZ).normalize() - today).days <= max_days
-        ],
-        key=lambda x: x[0]
-    )
-    exps_use = [e for _, e in exps_filt[:max(1, n_exps)]]
-    if not exps_use:
-        return pd.DataFrame()
-
-    rows = []
-    for e in exps_use:
-        try:
-            ch = tk.option_chain(e)
-            calls, puts = ch.calls.copy(), ch.puts.copy()
-        except Exception:
-            continue
-
-        for df in (calls, puts):
-            for c in ["volume", "openInterest", "impliedVolatility", "strike"]:
-                if c not in df.columns:
-                    df[c] = np.nan
-
-        strikes = np.sort(pd.concat([calls["strike"], puts["strike"]]).dropna().unique())
-        atm = _atm_strike(ref_price, strikes)
-        mC = calls[_band_mask(calls["strike"], atm, atm_band)]
-        mP = puts[_band_mask(puts["strike"], atm, atm_band)]
-
-        rows.append({
-            "exp": e,
-            "vol_c": float(np.nansum(mC["volume"])),
-            "vol_p": float(np.nansum(mP["volume"])),
-            "oi_c": float(np.nansum(mC["openInterest"])),
-            "oi_p": float(np.nansum(mP["openInterest"])),
-            "voi_c": float(np.nansum(mC["volume"])) / max(float(np.nansum(mC["openInterest"])), 1.0),
-            "voi_p": float(np.nansum(mP["volume"])) / max(float(np.nansum(mP["openInterest"])), 1.0),
-            "iv_c": float(np.nanmean(mC["impliedVolatility"])) if len(mC) else np.nan,
-            "iv_p": float(np.nanmean(mP["impliedVolatility"])) if len(mP) else np.nan
-        })
-
-    if not rows:
-        return pd.DataFrame()
-
-    agg = pd.DataFrame(rows).agg({
-        "vol_c": "sum",
-        "vol_p": "sum",
-        "oi_c": "sum",
-        "oi_p": "sum",
-        "voi_c": "mean",
-        "voi_p": "mean",
-        "iv_c": "mean",
-        "iv_p": "mean"
-    })
-
-    out = pd.DataFrame([{
-        "PCR_vol": float(agg["vol_p"] / max(agg["vol_c"], 1.0)),
-        "PCR_oi": float(agg["oi_p"] / max(agg["oi_c"], 1.0)),
-        "VOI_call": float(agg["voi_c"]),
-        "VOI_put": float(agg["voi_p"]),
-        "IV_skew_p_minus_c": float(agg["iv_p"] - agg["iv_c"]),
-        "VOL_tot": float(agg["vol_c"] + agg["vol_p"]),
-        "OI_tot": float(agg["oi_c"] + agg["oi_p"]),
-    }])
-    out.index = [pd.Timestamp.today(tz=LOCAL_TZ).normalize()]
-    return out
+def prefetch_intraday_parallel(tickers: List[str], sessions: int, interval: str) -> Dict[str, pd.DataFrame]:
+    """Parallel prefetch of intraday data for all tickers."""
+    result = {}
+    days_buffer = max(sessions * 2, 30)
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(tickers))) as ex:
+        fmap = {
+            ex.submit(get_intraday_sessions, tk, sessions, days_buffer, interval): tk
+            for tk in tickers
+        }
+        for fut in as_completed(fmap):
+            tk = fmap[fut]
+            try:
+                df_i = fut.result()
+                if not df_i.empty:
+                    result[tk] = df_i
+            except Exception:
+                pass
+    return result
 
 # ─────────────────────────────────────────────────────────────
 # Features
 # ─────────────────────────────────────────────────────────────
-def make_features(df, lookback, horizon, exog=None):
+def make_features(df: pd.DataFrame, lookback: int, horizon: int) -> pd.DataFrame:
     if len(df) < (lookback + horizon + 5):
         raise ValueError("Zu wenige Bars.")
     feat = df.copy()
@@ -847,8 +530,6 @@ def make_features(df, lookback, horizon, exog=None):
     feat["SlopeHigh"] = feat["High"].rolling(lookback).apply(slope, raw=True)
     feat["SlopeLow"] = feat["Low"].rolling(lookback).apply(slope, raw=True)
     feat = feat.iloc[lookback - 1:].copy()
-    if exog is not None and not exog.empty:
-        feat = feat.join(exog, how="left").ffill()
     feat["FutureRetExec"] = feat["Open"].shift(-horizon) / feat["Open"].shift(-1) - 1
     return feat
 
@@ -909,16 +590,11 @@ def backtest_next_open(
                     in_pos = True
                     last_ei = i
                     trades.append({
-                        "Date": de,
-                        "Typ": "Entry",
-                        "Price": round(sb, 4),
-                        "Shares": round(sh, 4),
-                        "Gross P&L": 0.0,
-                        "Fees": round(fee, 2),
-                        "Net P&L": 0.0,
-                        "kum P&L": round(cum, 2),
-                        "Prob": round(pp, 4),
-                        "HoldDays": np.nan
+                        "Date": de, "Typ": "Entry",
+                        "Price": round(sb, 4), "Shares": round(sh, 4),
+                        "Gross P&L": 0.0, "Fees": round(fee, 2),
+                        "Net P&L": 0.0, "kum P&L": round(cum, 2),
+                        "Prob": round(pp, 4), "HoldDays": np.nan
                     })
 
             elif in_pos and pp < exit_thr:
@@ -936,16 +612,11 @@ def backtest_next_open(
                     cb_n = 0.0
                     cum += pnl_n
                     trades.append({
-                        "Date": de,
-                        "Typ": "Exit",
-                        "Price": round(ss, 4),
-                        "Shares": 0.0,
-                        "Gross P&L": round(pnl_g, 2),
-                        "Fees": round(fe, 2),
-                        "Net P&L": round(pnl_n, 2),
-                        "kum P&L": round(cum, 2),
-                        "Prob": round(pp, 4),
-                        "HoldDays": int(held)
+                        "Date": de, "Typ": "Exit",
+                        "Price": round(ss, 4), "Shares": 0.0,
+                        "Gross P&L": round(pnl_g, 2), "Fees": round(fe, 2),
+                        "Net P&L": round(pnl_n, 2), "kum P&L": round(cum, 2),
+                        "Prob": round(pp, 4), "HoldDays": int(held)
                     })
                     last_xi = i
                     last_ei = None
@@ -980,14 +651,7 @@ def _sortino(rets):
 def _winrate(trades):
     if not trades:
         return np.nan
-    pnl = []
-    e = None
-    for ev in trades:
-        if ev["Typ"] == "Entry":
-            e = ev
-        elif ev["Typ"] == "Exit" and e is not None:
-            pnl.append(float(ev.get("Net P&L", 0.0)))
-            e = None
+    pnl = [float(ev.get("Net P&L", 0.0)) for ev in trades if ev["Typ"] == "Exit"]
     return float((np.array(pnl, float) > 0).mean()) if pnl else np.nan
 
 def compute_performance(df_bt, trades, init_cap):
@@ -998,6 +662,7 @@ def compute_performance(df_bt, trades, init_cap):
     dd = (df_bt["Equity_Net"] - df_bt["Equity_Net"].cummax()) / df_bt["Equity_Net"].cummax()
     max_dd = dd.min() * 100
     calmar = (net_ret / 100) / abs(max_dd / 100) if max_dd < 0 else np.nan
+    cagr_v = _cagr(df_bt["Equity_Net"])
 
     return {
         "Strategy Net (%)": round(float(net_ret), 2),
@@ -1012,8 +677,8 @@ def compute_performance(df_bt, trades, init_cap):
         "Phase": "Open" if trades and trades[-1]["Typ"] == "Entry" else "Flat",
         "Number of Trades": int(sum(1 for t in trades if t["Typ"] == "Exit")),
         "Net P&L (€)": round(float(df_bt["Equity_Net"].iloc[-1] - init_cap), 2),
-        "CAGR (%)": round(100 * float(_cagr(df_bt["Equity_Net"])) if np.isfinite(_cagr(df_bt["Equity_Net"])) else np.nan, 2),
-        "Winrate (%)": round(100 * float(_winrate(trades)) if np.isfinite(_winrate(trades)) else np.nan, 2),
+        "CAGR (%)": round(100 * float(cagr_v), 2) if np.isfinite(cagr_v) else np.nan,
+        "Winrate (%)": round(100 * float(_winrate(trades)), 2) if np.isfinite(_winrate(trades)) else np.nan,
         "InitCap (€)": float(init_cap),
     }
 
@@ -1032,14 +697,11 @@ def compute_round_trips(all_trades):
                 ep = float(ce.get("Price", np.nan))
                 xp = float(ev.get("Price", np.nan))
                 fe = float(ce.get("Fees", 0.0))
-                fx = float(ev.get("Fees", 0.0))
                 pnl = float(ev.get("Net P&L", 0.0))
                 cost = sh * ep + fe
                 rows.append({
-                    "Ticker": tk,
-                    "Name": name,
-                    "Entry Date": ed,
-                    "Exit Date": xd,
+                    "Ticker": tk, "Name": name,
+                    "Entry Date": ed, "Exit Date": xd,
                     "Hold (days)": (xd - ed).days,
                     "Entry Prob": ce.get("Prob", np.nan),
                     "Exit Prob": ev.get("Prob", np.nan),
@@ -1047,14 +709,14 @@ def compute_round_trips(all_trades):
                     "Entry Price": round(ep, 4),
                     "Exit Price": round(xp, 4),
                     "PnL Net (€)": round(pnl, 2),
-                    "Fees (€)": round(fe + fx, 2),
+                    "Fees (€)": round(fe + float(ev.get("Fees", 0.0)), 2),
                     "Return (%)": round(pnl / cost * 100, 2) if cost else np.nan
                 })
                 ce = None
     return pd.DataFrame(rows)
 
 # ─────────────────────────────────────────────────────────────
-# Forecast
+# Forecast / MC
 # ─────────────────────────────────────────────────────────────
 def estimate_expected_return(feat, forecast_days, threshold):
     if feat is None or feat.empty or "Open" not in feat.columns or "SignalProb" not in feat.columns:
@@ -1090,14 +752,9 @@ def portfolio_mc(exp_rets, cov, nav0, sims=1500, seed=42):
     q = np.quantile(pr, [.05, .5, .95])
     qn = np.quantile(nv, [.05, .5, .95])
     return {
-        "q05": float(q[0]),
-        "q50": float(q[1]),
-        "q95": float(q[2]),
-        "nq05": float(qn[0]),
-        "nq50": float(qn[1]),
-        "nq95": float(qn[2]),
-        "port_rets": pr,
-        "nav_paths": nv
+        "q05": float(q[0]), "q50": float(q[1]), "q95": float(q[2]),
+        "nq05": float(qn[0]), "nq50": float(qn[1]), "nq95": float(qn[2]),
+        "port_rets": pr, "nav_paths": nv
     }
 
 # ─────────────────────────────────────────────────────────────
@@ -1106,17 +763,15 @@ def portfolio_mc(exp_rets, cov, nav0, sims=1500, seed=42):
 def make_features_and_train(
     df, lookback, horizon, threshold, model_params,
     entry_prob, exit_prob, init_capital, pos_frac,
-    min_hold_days=0, cooldown_days=0, exog_df=None,
+    min_hold_days=0, cooldown_days=0,
     walk_forward=False, wf_min_train=120
 ):
-    feat = make_features(df, lookback, horizon, exog=exog_df)
+    feat = make_features(df, lookback, horizon)
     hist = feat.iloc[:-1].dropna(subset=["FutureRetExec"]).copy()
     if len(hist) < 30:
         raise ValueError("Zu wenige Datenpunkte.")
 
     X_cols = ["Range", "SlopeHigh", "SlopeLow"]
-    opt_c = ["PCR_vol", "PCR_oi", "VOI_call", "VOI_put", "IV_skew_p_minus_c", "VOL_tot", "OI_tot"]
-    X_cols += [c for c in opt_c if c in feat.columns]
     hist["Target"] = (hist["FutureRetExec"] > threshold).astype(int)
 
     def pipe():
@@ -1165,12 +820,9 @@ def chart_price_signal(feat, trades, ticker):
     if all(c in feat.columns for c in ["Open", "High", "Low", "Close"]):
         fig.add_trace(go.Candlestick(
             x=feat.index,
-            open=feat["Open"],
-            high=feat["High"],
-            low=feat["Low"],
-            close=feat["Close"],
-            name="OHLC",
-            showlegend=False,
+            open=feat["Open"], high=feat["High"],
+            low=feat["Low"], close=feat["Close"],
+            name="OHLC", showlegend=False,
             increasing=dict(line=dict(color=THEME["green"], width=1), fillcolor="rgba(22,163,74,0.18)"),
             decreasing=dict(line=dict(color=THEME["red"], width=1), fillcolor="rgba(220,38,38,0.16)"),
         ), row=1, col=1)
@@ -1187,23 +839,16 @@ def chart_price_signal(feat, trades, ticker):
             sub = tdf[tdf["Typ"] == typ]
             if not sub.empty:
                 fig.add_trace(go.Scatter(
-                    x=sub["Date"],
-                    y=sub["Price"],
-                    mode="markers",
-                    name=typ,
+                    x=sub["Date"], y=sub["Price"], mode="markers", name=typ,
                     marker=dict(symbol=sym, size=11, color=col, line=dict(color="white", width=1.5)),
                     hovertemplate=f"<b>{typ}</b><br>%{{x|%Y-%m-%d}}<br>%{{y:.2f}}<extra></extra>",
                 ), row=1, col=1)
 
     prob = feat["SignalProb"]
     fig.add_trace(go.Scatter(
-        x=feat.index,
-        y=prob,
-        mode="lines",
-        name="Signal Prob",
+        x=feat.index, y=prob, mode="lines", name="Signal Prob",
         line=dict(color=THEME["accent4"], width=1.5),
-        fill="tozeroy",
-        fillcolor="rgba(124,58,237,0.10)",
+        fill="tozeroy", fillcolor="rgba(124,58,237,0.10)",
         hovertemplate="%{x|%Y-%m-%d}<br>P=%{y:.4f}<extra></extra>",
     ), row=2, col=1)
 
@@ -1227,35 +872,21 @@ def chart_equity(df_bt, ticker, init_cap):
         rows=2, cols=1, shared_xaxes=True,
         row_heights=[0.65, 0.35], vertical_spacing=0.04
     )
-
     fig.add_trace(go.Scatter(
-        x=eq.index,
-        y=eq,
-        mode="lines",
-        name="Strategie",
+        x=eq.index, y=eq, mode="lines", name="Strategie",
         line=dict(color=THEME["accent1"], width=2),
-        fill="tozeroy",
-        fillcolor="rgba(200,169,107,0.10)",
+        fill="tozeroy", fillcolor="rgba(200,169,107,0.10)",
         hovertemplate="%{x|%Y-%m-%d}  %{y:,.2f}€<extra></extra>",
     ), row=1, col=1)
-
     fig.add_trace(go.Scatter(
-        x=bh.index,
-        y=bh,
-        mode="lines",
-        name="Buy & Hold",
+        x=bh.index, y=bh, mode="lines", name="Buy & Hold",
         line=dict(color=THEME["muted"], width=1.5, dash="dot"),
         hovertemplate="%{x|%Y-%m-%d}  B&H: %{y:,.2f}€<extra></extra>",
     ), row=1, col=1)
-
     fig.add_trace(go.Scatter(
-        x=dd.index,
-        y=dd,
-        mode="lines",
-        name="Drawdown",
+        x=dd.index, y=dd, mode="lines", name="Drawdown",
         line=dict(color=THEME["red"], width=1),
-        fill="tozeroy",
-        fillcolor="rgba(220,38,38,0.10)",
+        fill="tozeroy", fillcolor="rgba(220,38,38,0.10)",
         showlegend=False,
         hovertemplate="%{x|%Y-%m-%d}  DD: %{y:.2f}%<extra></extra>",
     ), row=2, col=1)
@@ -1268,81 +899,92 @@ def chart_equity(df_bt, ticker, init_cap):
     )
     return fig
 
-def chart_intraday(intra, ticker, tdf, chart_type, interval):
+def chart_intraday(intra: pd.DataFrame, ticker: str, tdf: pd.DataFrame, sessions: int, interval: str) -> go.Figure:
+    """
+    Linienchart über die letzten N Trading-Sessions ohne Wochenend- und Nachtlücken.
+    Tages-Trennlinien werden als vertikale gestrichelte Linien gezeichnet.
+    """
     fig = go.Figure()
 
-    if chart_type == "Candlestick (OHLC)":
-        fig.add_trace(go.Candlestick(
-            x=intra.index,
-            open=intra["Open"],
-            high=intra["High"],
-            low=intra["Low"],
-            close=intra["Close"],
-            showlegend=False,
-            increasing=dict(line=dict(color=THEME["green"], width=1), fillcolor="rgba(22,163,74,0.18)"),
-            decreasing=dict(line=dict(color=THEME["red"], width=1), fillcolor="rgba(220,38,38,0.16)"),
-        ))
-    else:
-        fig.add_trace(go.Scatter(
-            x=intra.index, y=intra["Close"], mode="lines",
-            line=dict(color=THEME["accent1"], width=1.5), showlegend=False
-        ))
+    # ── Linienchart (Close) ──────────────────────────────────
+    fig.add_trace(go.Scatter(
+        x=intra.index,
+        y=intra["Close"],
+        mode="lines",
+        name="Close",
+        line=dict(color=THEME["accent1"], width=1.8),
+        fill="tozeroy",
+        fillcolor="rgba(200,169,107,0.08)",
+        hovertemplate="%{x|%d.%m %H:%M}  %{y:.2f}<extra></extra>",
+    ))
 
-    for _, ds in intra.groupby(intra.index.normalize()):
+    # ── Session-Trennlinien ──────────────────────────────────
+    unique_days = sorted(intra.index.normalize().unique())
+    for day in unique_days[1:]:          # ab dem zweiten Tag
+        first_bar = intra.loc[intra.index.normalize() == day].index[0]
         fig.add_vline(
-            x=ds.index.min(),
-            line_width=1,
-            line_dash="dot",
-            line_color=THEME["border"],
-            opacity=0.5
+            x=first_bar,
+            line_width=1, line_dash="dot",
+            line_color=THEME["border"], opacity=0.7,
         )
 
+    # ── Day-Labels oben ─────────────────────────────────────
+    for day in unique_days:
+        bars = intra.loc[intra.index.normalize() == day]
+        mid_bar = bars.index[len(bars) // 2]
+        fig.add_annotation(
+            x=mid_bar, y=1.0, yref="paper",
+            text=day.strftime("%d.%m"),
+            showarrow=False,
+            font=dict(size=9, color=THEME["muted"], family="'Inter', sans-serif"),
+            xanchor="center", yanchor="bottom",
+        )
+
+    # ── Entry/Exit-Marker (letzte Sessions) ─────────────────
     if not tdf.empty:
         tdf2 = tdf.copy()
         tdf2["Date"] = pd.to_datetime(tdf2["Date"])
-        last_days = set(intra.index.normalize())
-        ev = tdf2[tdf2["Date"].dt.normalize().isin(last_days)]
+        visible_days = set(intra.index.normalize())
+        ev = tdf2[tdf2["Date"].dt.normalize().isin(visible_days)]
         for typ, col, sym in [("Entry", THEME["green"], "triangle-up"), ("Exit", THEME["red"], "triangle-down")]:
-            xs, ys = [], []
-            for d, ds in intra.groupby(intra.index.normalize()):
-                h = ev[(ev["Typ"] == typ) & (ev["Date"].dt.normalize() == d)]
-                if h.empty:
-                    continue
-                xs.append(ds.index.min())
-                ys.append(float(h["Price"].iloc[-1]))
-            if xs:
+            sub = ev[ev["Typ"] == typ]
+            if not sub.empty:
                 fig.add_trace(go.Scatter(
-                    x=xs, y=ys, mode="markers", name=typ,
-                    marker=dict(symbol=sym, size=11, color=col, line=dict(color="white", width=1.5))
+                    x=sub["Date"], y=sub["Price"],
+                    mode="markers", name=typ,
+                    marker=dict(symbol=sym, size=11, color=col, line=dict(color="white", width=1.5)),
+                    hovertemplate=f"<b>{typ}</b><br>%{{x|%d.%m %H:%M}}<br>%{{y:.2f}}<extra></extra>",
                 ))
 
-    _apply_theme(fig, 400)
+    # ── Rangebreaks: Wochenenden + Nacht (außerhalb 07:00-22:00) ──
+    fig.update_xaxes(
+        rangebreaks=[
+            dict(bounds=["sat", "mon"]),                    # Wochenenden
+            dict(bounds=[22, 7], pattern="hour"),           # Nacht
+        ],
+        tickformat="%H:%M",
+        showgrid=True,
+        gridcolor=THEME["grid"],
+    )
+
+    _apply_theme(fig, 420)
     fig.update_layout(
-        title=dict(text=f"<b>{ticker}</b>  ·  Intraday 5d ({interval})", font=dict(size=13, color=THEME["muted"])),
+        title=dict(
+            text=f"<b>{ticker}</b>  ·  Intraday {int(sessions)} Sessions ({interval})",
+            font=dict(size=13, color=THEME["muted"])
+        ),
         xaxis_rangeslider_visible=False,
+        showlegend=True,
     )
     return fig
 
 def chart_corr(corr):
     fig = go.Figure(go.Heatmap(
-        z=corr.values,
-        x=corr.columns,
-        y=corr.index,
-        text=corr.round(2).astype(str).values,
-        texttemplate="%{text}",
-        colorscale=[
-            [0.0, "#FCA5A5"],
-            [0.5, "#F8FAFC"],
-            [1.0, "#86EFAC"]
-        ],
-        zmid=0,
-        zmin=-1,
-        zmax=1,
-        colorbar=dict(
-            title="ρ",
-            thickness=10,
-            tickfont=dict(family="'Inter', sans-serif", size=10)
-        ),
+        z=corr.values, x=corr.columns, y=corr.index,
+        text=corr.round(2).astype(str).values, texttemplate="%{text}",
+        colorscale=[[0.0, "#FCA5A5"], [0.5, "#F8FAFC"], [1.0, "#86EFAC"]],
+        zmid=0, zmin=-1, zmax=1,
+        colorbar=dict(title="ρ", thickness=10, tickfont=dict(family="'Inter', sans-serif", size=10)),
         hovertemplate="<b>%{x}</b> vs <b>%{y}</b><br>ρ = %{z:.3f}<extra></extra>",
         textfont=dict(size=10 if corr.shape[0] <= 8 else 8),
     ))
@@ -1357,12 +999,9 @@ def chart_corr(corr):
 
 def chart_portfolio_nav(nav):
     fig = go.Figure(go.Scatter(
-        x=nav.index,
-        y=nav.values,
-        mode="lines",
+        x=nav.index, y=nav.values, mode="lines",
         line=dict(color=THEME["accent1"], width=2),
-        fill="tozeroy",
-        fillcolor="rgba(200,169,107,0.10)",
+        fill="tozeroy", fillcolor="rgba(200,169,107,0.10)",
         hovertemplate="%{x|%Y-%m-%d}  %{y:,.0f}€<extra></extra>",
         name="NAV",
     ))
@@ -1377,49 +1016,32 @@ def chart_portfolio_nav(nav):
 def chart_mc_histogram(port_rets, q05, q50, q95, forecast_days, sims):
     fig = go.Figure()
     fig.add_trace(go.Histogram(
-        x=port_rets * 100,
-        nbinsx=50,
+        x=port_rets * 100, nbinsx=50,
         marker=dict(
             color=["rgba(22,163,74,0.55)" if v >= 0 else "rgba(220,38,38,0.45)" for v in port_rets],
             line=dict(color="rgba(0,0,0,0)", width=0)
         ),
         showlegend=False,
-        hovertemplate="Return: %{x:.2f}%<br>Anzahl: %{y}<extra></extra>",
+        hovertemplate="Return: %{x:.2f}%<br>n: %{y}<extra></extra>",
     ))
-
-    for val, lbl, col in [
-        (q05 * 100, "5%", THEME["red"]),
-        (q50 * 100, "50%", THEME["accent3"]),
-        (q95 * 100, "95%", THEME["green"])
-    ]:
+    for val, lbl, col in [(q05 * 100, "5%", THEME["red"]), (q50 * 100, "50%", THEME["accent3"]), (q95 * 100, "95%", THEME["green"])]:
         fig.add_vline(
-            x=val,
-            line_dash="dash",
-            line_color=col,
-            line_width=1.5,
-            opacity=0.8,
+            x=val, line_dash="dash", line_color=col, line_width=1.5, opacity=0.8,
             annotation_text=f"  {lbl}: {val:.2f}%",
             annotation_font=dict(color=col, size=9, family="'Inter', sans-serif"),
             annotation_position="top right"
         )
-
     _apply_theme(fig, 360)
     fig.update_layout(
-        title=dict(
-            text=f"MC Portfolio Returns  ·  {forecast_days}d  ·  {sims} Sim.",
-            font=dict(size=13, color=THEME["muted"])
-        ),
-        xaxis_title="Return (%)",
-        yaxis_title="Häufigkeit",
-        bargap=0.04,
+        title=dict(text=f"MC Portfolio Returns  ·  {forecast_days}d  ·  {sims} Sim.", font=dict(size=13, color=THEME["muted"])),
+        xaxis_title="Return (%)", yaxis_title="Häufigkeit", bargap=0.04,
     )
     return fig
 
 def chart_histogram(data, xlabel, title, bins):
     mean_v = float(data.mean()) if len(data) else np.nan
     fig = go.Figure(go.Histogram(
-        x=data,
-        nbinsx=bins,
+        x=data, nbinsx=bins,
         marker=dict(
             color=["rgba(22,163,74,0.55)" if v >= 0 else "rgba(220,38,38,0.45)" for v in data],
             line=dict(color="rgba(0,0,0,0)", width=0)
@@ -1430,10 +1052,7 @@ def chart_histogram(data, xlabel, title, bins):
     fig.add_vline(x=0, line_color=THEME["muted"], line_width=1, opacity=0.4)
     if np.isfinite(mean_v):
         fig.add_vline(
-            x=mean_v,
-            line_dash="dot",
-            line_color=THEME["accent2"],
-            line_width=1.5,
+            x=mean_v, line_dash="dot", line_color=THEME["accent2"], line_width=1.5,
             annotation_text=f"  Ø {mean_v:.2f}",
             annotation_font=dict(color=THEME["accent2"], size=9, family="'Inter', sans-serif"),
             annotation_position="top right"
@@ -1441,9 +1060,7 @@ def chart_histogram(data, xlabel, title, bins):
     _apply_theme(fig, 340)
     fig.update_layout(
         title=dict(text=title, font=dict(size=13, color=THEME["muted"])),
-        xaxis_title=xlabel,
-        yaxis_title="n",
-        bargap=0.05
+        xaxis_title=xlabel, yaxis_title="n", bargap=0.05
     )
     return fig
 
@@ -1577,9 +1194,7 @@ with st.expander("⚙ Random-Search Optimizer  ·  Walk-Forward Light", expanded
                 st.dataframe(pd.DataFrame(err_c.most_common(10), columns=["Error", "Count"]))
         else:
             df_res_o = pd.DataFrame(rows_o).sort_values("score", ascending=False)
-            st.success(
-                f"✅ Best Score: **{best_o['score']:.3f}** · Sharpe: **{best_o['sharpe_med']:.2f}** · Trades: **{best_o['trades']}**"
-            )
+            st.success(f"✅ Best Score: **{best_o['score']:.3f}** · Sharpe: **{best_o['sharpe_med']:.2f}** · Trades: **{best_o['trades']}**")
             bc = st.columns(5)
             bc[0].metric("Lookback", int(best_o["lookback"]))
             bc[1].metric("Horizon", int(best_o["horizon"]))
@@ -1588,10 +1203,8 @@ with st.expander("⚙ Random-Search Optimizer  ·  Walk-Forward Light", expanded
             bc[4].metric("Exit Prob", f"{best_o['exit']:.2f}")
             st.dataframe(df_res_o.head(25), use_container_width=True)
             st.download_button(
-                "⬇ Optimizer-Ergebnisse",
-                to_csv_eu(df_res_o),
-                file_name="optimizer_results.csv",
-                mime="text/csv"
+                "⬇ Optimizer-Ergebnisse", to_csv_eu(df_res_o),
+                file_name="optimizer_results.csv", mime="text/csv"
             )
 
 # ─────────────────────────────────────────────────────────────
@@ -1614,29 +1227,13 @@ price_map, meta_map = load_all_prices(
     use_live, intraday_interval, fallback_last_session, exec_mode, int(moc_cutoff_min)
 )
 
-options_live: Dict[str, pd.DataFrame] = {}
-if use_chain_live:
-    with st.spinner("📊 Optionsketten einlesen …"):
-        po = st.progress(0.0)
-        tks = list(price_map.keys())
-        for i, tk in enumerate(tks):
-            try:
-                df_o = price_map[tk]
-                if df_o is None or df_o.empty:
-                    continue
-                ch = get_equity_chain_aggregates_for_today(
-                    tk,
-                    float(df_o["Close"].iloc[-1]),
-                    atm_band_pct,
-                    int(n_expiries),
-                    int(max_days_to_exp)
-                )
-                if not ch.empty:
-                    options_live[tk] = ch
-            except Exception:
-                pass
-            finally:
-                po.progress((i + 1) / max(1, len(tks)))
+# Parallel Intraday Prefetch für alle Ticker
+intraday_cache: Dict[str, pd.DataFrame] = {}
+if price_map:
+    with st.spinner(f"📊 Intraday · {len(price_map)} Ticker · {int(INTRADAY_SESSIONS)} Sessions"):
+        intraday_cache = prefetch_intraday_parallel(
+            list(price_map.keys()), int(INTRADAY_SESSIONS), intraday_interval
+        )
 
 live_forecasts_run: List[dict] = []
 _decide = lambda p, en, ex: "Enter / Add" if p > en else ("Exit / Reduce" if p < ex else "Hold / No Trade")
@@ -1662,18 +1259,12 @@ for ticker in TICKERS:
                 f"Target: FutureRetExec > {THRESH:.3f} in {HORIZON}d"
             )
 
-            exog_tk = None
-            if use_chain_live and ticker in options_live and not options_live[ticker].empty:
-                ch = options_live[ticker].copy()
-                ch.index = [df.index[-1].normalize()]
-                exog_tk = ch
-
             feat, df_bt, trades, metrics = make_features_and_train(
                 df, int(LOOKBACK), int(HORIZON), float(THRESH), MODEL_PARAMS,
                 float(ENTRY_PROB), float(EXIT_PROB),
                 init_capital=float(INIT_CAP_PER_TICKER), pos_frac=float(POS_FRAC),
                 min_hold_days=int(MIN_HOLD_DAYS), cooldown_days=int(COOLDOWN_DAYS),
-                exog_df=exog_tk, walk_forward=bool(use_walk_forward), wf_min_train=int(wf_min_train),
+                walk_forward=bool(use_walk_forward), wf_min_train=int(wf_min_train),
             )
 
             metrics["Ticker"] = ticker
@@ -1686,23 +1277,14 @@ for ticker in TICKERS:
             live_close = float(feat["Close"].iloc[-1]) if "Close" in feat.columns else np.nan
             live_act = _decide(live_prob, float(ENTRY_PROB), float(EXIT_PROB))
 
-            row = {
+            live_forecasts_run.append({
                 "AsOf": pd.Timestamp(feat.index[-1]).strftime("%Y-%m-%d %H:%M"),
-                "Ticker": ticker,
-                "Name": name,
+                "Ticker": ticker, "Name": name,
                 f"P(>{THRESH:.3f} in {HORIZON}d)": round(live_prob, 4),
                 "Action": live_act,
                 "Close": round(live_close, 4),
                 "Bar": "intraday" if meta.get("tail_is_intraday") else "daily"
-            }
-
-            if use_chain_live and exog_tk is not None:
-                for col in ["PCR_vol", "PCR_oi", "VOI_call", "VOI_put", "IV_skew_p_minus_c", "VOL_tot", "OI_tot"]:
-                    v = exog_tk.iloc[-1].get(col, np.nan)
-                    if pd.notna(v):
-                        row[col] = round(float(v), 4)
-
-            live_forecasts_run.append(row)
+            })
 
             mn = metrics
             phase_cls = "kpi-info" if mn["Phase"] == "Open" else ""
@@ -1723,25 +1305,23 @@ for ticker in TICKERS:
             with cc1:
                 st.plotly_chart(
                     chart_price_signal(feat, trades, ticker),
-                    use_container_width=True,
-                    config={"displayModeBar": False}
+                    use_container_width=True, config={"displayModeBar": False}
                 )
 
-            intra = get_intraday_last_n_sessions(ticker, 5, 10, intraday_interval)
+            # Intraday aus prefetch Cache
+            intra = intraday_cache.get(ticker, pd.DataFrame())
             with cc2:
                 if intra.empty:
                     st.info("Keine Intraday-Daten.")
                 else:
                     st.plotly_chart(
-                        chart_intraday(intra, ticker, tdf_loc, intraday_chart_type, intraday_interval),
-                        use_container_width=True,
-                        config={"displayModeBar": False}
+                        chart_intraday(intra, ticker, tdf_loc, int(INTRADAY_SESSIONS), intraday_interval),
+                        use_container_width=True, config={"displayModeBar": False}
                     )
 
             st.plotly_chart(
                 chart_equity(df_bt, ticker, float(INIT_CAP_PER_TICKER)),
-                use_container_width=True,
-                config={"displayModeBar": False}
+                use_container_width=True, config={"displayModeBar": False}
             )
 
             with st.expander(f"🗒 Trade-Log  ·  {ticker}", expanded=False):
@@ -1754,39 +1334,29 @@ for ticker in TICKERS:
                     if "Date" in td.columns:
                         td["Date"] = pd.to_datetime(td["Date"]).dt.strftime("%d.%m.%Y")
                     td = td.rename(columns={
-                        "Prob": "Signal Prob",
-                        "HoldDays": "Hold (days)",
-                        "Net P&L": "PnL",
-                        "kum P&L": "CumPnL"
+                        "Prob": "Signal Prob", "HoldDays": "Hold (days)",
+                        "Net P&L": "PnL", "kum P&L": "CumPnL"
                     })
-                    desired = ["Ticker", "Name", "Date", "Typ", "Price", "Shares", "Signal Prob", "Hold (days)", "PnL", "CumPnL", "Fees"]
+                    desired = ["Ticker", "Name", "Date", "Typ", "Price", "Shares",
+                               "Signal Prob", "Hold (days)", "PnL", "CumPnL", "Fees"]
                     sc = [c for c in desired if c in td.columns]
 
                     def _rc(row):
                         t = str(row.get("Typ", "")).lower()
-                        if "entry" in t:
-                            return [f"color: {THEME['green']}"] * len(row)
-                        if "exit" in t:
-                            return [f"color: {THEME['red']}"] * len(row)
+                        if "entry" in t: return [f"color: {THEME['green']}"] * len(row)
+                        if "exit" in t:  return [f"color: {THEME['red']}"] * len(row)
                         return [""] * len(row)
 
                     st.dataframe(
                         td[sc].style.format({
-                            "Price": "{:.2f}",
-                            "Shares": "{:.4f}",
-                            "Signal Prob": "{:.4f}",
-                            "PnL": "{:.2f}",
-                            "CumPnL": "{:.2f}",
-                            "Fees": "{:.2f}"
+                            "Price": "{:.2f}", "Shares": "{:.4f}", "Signal Prob": "{:.4f}",
+                            "PnL": "{:.2f}", "CumPnL": "{:.2f}", "Fees": "{:.2f}"
                         }).apply(_rc, axis=1),
                         use_container_width=True
                     )
                     st.download_button(
-                        f"⬇ Trades {ticker}",
-                        to_csv_eu(td[sc]),
-                        file_name=f"trades_{ticker}.csv",
-                        mime="text/csv",
-                        key=f"dl_tr_{ticker}"
+                        f"⬇ Trades {ticker}", to_csv_eu(td[sc]),
+                        file_name=f"trades_{ticker}.csv", mime="text/csv", key=f"dl_tr_{ticker}"
                     )
 
         except Exception as e:
@@ -1824,35 +1394,24 @@ if live_forecasts_run:
         ("◆ Hold", f"{n_hold}", ""),
     ])
 
-    desired_lf = ["AsOf", "Ticker", "Name", prob_col, "Action", "Close", "Target_5d", "Bar"]
-    if use_chain_live:
-        desired_lf = ["AsOf", "Ticker", "Name", prob_col, "Action", "PCR_oi", "PCR_vol", "VOI_call", "VOI_put", "Close", "Target_5d", "Bar"]
-    show_lf = [c for c in desired_lf if c in live_df.columns]
+    show_lf = [c for c in ["AsOf", "Ticker", "Name", prob_col, "Action", "Close", "Target_5d", "Bar"] if c in live_df.columns]
 
     def _board_color(row):
         a = str(row.get("Action", "")).lower()
-        if "enter" in a:
-            return [f"background: rgba(22,163,74,0.06)"] * len(row)
-        if "exit" in a:
-            return [f"background: rgba(220,38,38,0.06)"] * len(row)
+        if "enter" in a: return ["background: rgba(22,163,74,0.06)"] * len(row)
+        if "exit" in a:  return ["background: rgba(220,38,38,0.06)"] * len(row)
         return [""] * len(row)
 
-    fmt_lf = {prob_col: "{:.4f}", "Close": "{:.2f}", "Target_5d": "{:.2f}"}
-    for c in ["PCR_oi", "PCR_vol", "VOI_call", "VOI_put"]:
-        if c in live_df.columns:
-            fmt_lf[c] = "{:.3f}"
-
     st.dataframe(
-        live_df[show_lf].style.format(fmt_lf).apply(_board_color, axis=1),
+        live_df[show_lf].style
+            .format({prob_col: "{:.4f}", "Close": "{:.2f}", "Target_5d": "{:.2f}"})
+            .apply(_board_color, axis=1),
         use_container_width=True,
         height=min(600, 40 + 35 * len(live_df)),
     )
-
     st.download_button(
-        "⬇ Forecasts CSV",
-        to_csv_eu(live_df),
-        file_name=f"live_forecasts_{HORIZON}d.csv",
-        mime="text/csv"
+        "⬇ Forecasts CSV", to_csv_eu(live_df),
+        file_name=f"live_forecasts_{HORIZON}d.csv", mime="text/csv"
     )
 
 # ─────────────────────────────────────────────────────────────
@@ -1871,7 +1430,6 @@ if results:
     total_net = float(summary_df["Net P&L (€)"].sum())
     total_fees = float(summary_df["Fees (€)"].sum())
     total_gross = total_net + total_fees
-    total_cap = float(INIT_CAP_PER_TICKER) * len(summary_df)
 
     section("PORTFOLIO SUMMARY")
     kpi_row([
@@ -1899,32 +1457,22 @@ if results:
     pct_c = ["Strategy Net (%)", "Strategy Gross (%)", "Buy & Hold Net (%)", "Net P&L (%)", "CAGR (%)"]
     styled_s = (
         summary_df.style.format({
-            "Strategy Net (%)": "{:.2f}",
-            "Strategy Gross (%)": "{:.2f}",
-            "Buy & Hold Net (%)": "{:.2f}",
-            "Volatility (%)": "{:.2f}",
-            "Sharpe-Ratio": "{:.2f}",
-            "Sortino-Ratio": "{:.2f}",
-            "Max Drawdown (%)": "{:.2f}",
-            "Calmar-Ratio": "{:.2f}",
-            "Fees (€)": "{:.2f}",
-            "Net P&L (%)": "{:.2f}",
-            "Net P&L (€)": "{:.2f}",
-            "CAGR (%)": "{:.2f}",
-            "Winrate (%)": "{:.2f}",
-            "InitCap (€)": "{:.0f}"
-        })
-        .applymap(_num_col, subset=[c for c in pct_c if c in summary_df.columns])
+            "Strategy Net (%)": "{:.2f}", "Strategy Gross (%)": "{:.2f}",
+            "Buy & Hold Net (%)": "{:.2f}", "Volatility (%)": "{:.2f}",
+            "Sharpe-Ratio": "{:.2f}", "Sortino-Ratio": "{:.2f}",
+            "Max Drawdown (%)": "{:.2f}", "Calmar-Ratio": "{:.2f}",
+            "Fees (€)": "{:.2f}", "Net P&L (%)": "{:.2f}",
+            "Net P&L (€)": "{:.2f}", "CAGR (%)": "{:.2f}",
+            "Winrate (%)": "{:.2f}", "InitCap (€)": "{:.0f}"
+        }).applymap(_num_col, subset=[c for c in pct_c if c in summary_df.columns])
     )
     if "Phase" in summary_df.columns:
         styled_s = styled_s.applymap(_phase_col, subset=["Phase"])
 
     st.dataframe(styled_s, use_container_width=True)
     st.download_button(
-        "⬇ Summary CSV",
-        to_csv_eu(summary_df.reset_index()),
-        file_name="strategy_summary.csv",
-        mime="text/csv"
+        "⬇ Summary CSV", to_csv_eu(summary_df.reset_index()),
+        file_name="strategy_summary.csv", mime="text/csv"
     )
 
     section("OFFENE POSITIONEN")
@@ -1935,8 +1483,7 @@ if results:
             lc = float(all_dfs[ticker]["Close"].iloc[-1])
             upnl = (lc - float(le["Price"])) * float(le["Shares"])
             open_positions.append({
-                "Ticker": ticker,
-                "Name": get_ticker_name(ticker),
+                "Ticker": ticker, "Name": get_ticker_name(ticker),
                 "Entry Date": pd.to_datetime(le["Date"]).strftime("%Y-%m-%d"),
                 "Entry Price": round(float(le["Price"]), 2),
                 "Close": round(lc, 2),
@@ -1955,19 +1502,12 @@ if results:
 
         st.dataframe(
             op_df.style.format({
-                "Entry Price": "{:.2f}",
-                "Close": "{:.2f}",
-                "Signal Prob": "{:.4f}",
-                "uPnL (€)": "{:.2f}"
+                "Entry Price": "{:.2f}", "Close": "{:.2f}",
+                "Signal Prob": "{:.4f}", "uPnL (€)": "{:.2f}"
             }).applymap(_upnl_c, subset=["uPnL (€)"]),
             use_container_width=True
         )
-        st.download_button(
-            "⬇ Open Positions",
-            to_csv_eu(op_df),
-            file_name="open_positions.csv",
-            mime="text/csv"
-        )
+        st.download_button("⬇ Open Positions", to_csv_eu(op_df), file_name="open_positions.csv", mime="text/csv")
     else:
         st.success("✅ Keine offenen Positionen.")
 
@@ -2002,23 +1542,15 @@ if results:
 
         st.dataframe(
             rt_disp.sort_values("Exit Date", ascending=False).style.format({
-                "Shares": "{:.4f}",
-                "Entry Price": "{:.2f}",
-                "Exit Price": "{:.2f}",
-                "PnL Net (€)": "{:.2f}",
-                "Fees (€)": "{:.2f}",
-                "Return (%)": "{:.2f}",
-                "Entry Prob": "{:.4f}",
-                "Exit Prob": "{:.4f}"
+                "Shares": "{:.4f}", "Entry Price": "{:.2f}", "Exit Price": "{:.2f}",
+                "PnL Net (€)": "{:.2f}", "Fees (€)": "{:.2f}", "Return (%)": "{:.2f}",
+                "Entry Prob": "{:.4f}", "Exit Prob": "{:.4f}"
             }).applymap(_ret_c, subset=["Return (%)", "PnL Net (€)"]),
             use_container_width=True
         )
-
         st.download_button(
-            "⬇ Round-Trips CSV",
-            to_csv_eu(rt_disp),
-            file_name="round_trips.csv",
-            mime="text/csv"
+            "⬇ Round-Trips CSV", to_csv_eu(rt_disp),
+            file_name="round_trips.csv", mime="text/csv"
         )
 
         section("RETURN-VERTEILUNG")
@@ -2026,18 +1558,12 @@ if results:
         hc1, hc2 = st.columns(2)
         with hc1:
             if not ret.empty:
-                st.plotly_chart(
-                    chart_histogram(ret, "Return (%)", "Trade Returns (%)", bins_rt),
-                    use_container_width=True,
-                    config={"displayModeBar": False}
-                )
+                st.plotly_chart(chart_histogram(ret, "Return (%)", "Trade Returns (%)", bins_rt),
+                                use_container_width=True, config={"displayModeBar": False})
         with hc2:
             if not pnl.empty:
-                st.plotly_chart(
-                    chart_histogram(pnl, "PnL Net (€)", "Trade P&L (€)", bins_rt),
-                    use_container_width=True,
-                    config={"displayModeBar": False}
-                )
+                st.plotly_chart(chart_histogram(pnl, "PnL Net (€)", "Trade P&L (€)", bins_rt),
+                                use_container_width=True, config={"displayModeBar": False})
 
     section("PORTFOLIO  ·  EQUAL-WEIGHT")
     price_series = []
@@ -2086,17 +1612,11 @@ if results:
                 ("Max DD", f"{max_dd_p*100:.2f}%", "kpi-neg"),
             ])
 
-            st.plotly_chart(
-                chart_portfolio_nav(nav),
-                use_container_width=True,
-                config={"displayModeBar": False}
-            )
-
+            st.plotly_chart(chart_portfolio_nav(nav), use_container_width=True, config={"displayModeBar": False})
             st.download_button(
                 "⬇ Portfolio Returns CSV",
                 to_csv_eu(pd.DataFrame({"Date": port_ret.index, "PortRet": port_ret.values})),
-                file_name="portfolio_returns.csv",
-                mime="text/csv"
+                file_name="portfolio_returns.csv", mime="text/csv"
             )
 
     if not prices_port.empty and prices_port.shape[1] >= 2:
@@ -2140,13 +1660,11 @@ if results:
                 ("σ(ρ)", f"{np.std(off):.2f}" if off.size else "–", ""),
                 ("IPC (norm.)", f"{ipc:.2f}" if np.isfinite(ipc) else "–", "kpi-info"),
             ])
-
             st.caption(f"Basis: {len(rc)} Zeitpunkte · {freq_lbl} · {corr_meth}")
             st.download_button(
                 "⬇ Korrelationsmatrix CSV",
                 to_csv_eu(corr.reset_index().rename(columns={"index": "Ticker"})),
-                file_name="correlation_matrix.csv",
-                mime="text/csv"
+                file_name="correlation_matrix.csv", mime="text/csv"
             )
         else:
             st.info("Zu wenig Overlap für Korrelationsmatrix.")
@@ -2159,11 +1677,8 @@ if results:
         if not est:
             continue
         rows_fc.append({
-            "Ticker": tk,
-            "Name": get_ticker_name(tk),
-            "p (Prob)": est["p"],
-            "μ1": est["mu1"],
-            "μ0": est["mu0"],
+            "Ticker": tk, "Name": get_ticker_name(tk),
+            "p (Prob)": est["p"], "μ1": est["mu1"], "μ0": est["mu0"],
             f"E[r {int(FORECAST_DAYS)}d]": est["exp_ret"]
         })
 
@@ -2174,10 +1689,7 @@ if results:
         ercol = f"E[r {int(FORECAST_DAYS)}d]"
         st.dataframe(
             fc_df.sort_values(ercol, ascending=False).style.format({
-                "p (Prob)": "{:.4f}",
-                "μ1": "{:.4f}",
-                "μ0": "{:.4f}",
-                ercol: "{:.4f}"
+                "p (Prob)": "{:.4f}", "μ1": "{:.4f}", "μ0": "{:.4f}", ercol: "{:.4f}"
             }).applymap(_num_col, subset=[ercol]),
             use_container_width=True
         )
@@ -2197,8 +1709,7 @@ if results:
             else:
                 cov_h = pd.DataFrame(
                     np.diag(np.full(len(exp_rets), (0.02) ** 2)),
-                    index=exp_rets.index,
-                    columns=exp_rets.index
+                    index=exp_rets.index, columns=exp_rets.index
                 )
 
             nav0_fc = float(INIT_CAP_PER_TICKER) * len(summary_df)
@@ -2216,8 +1727,7 @@ if results:
                     out_mc["port_rets"], out_mc["q05"], out_mc["q50"],
                     out_mc["q95"], int(FORECAST_DAYS), int(MC_SIMS)
                 ),
-                use_container_width=True,
-                config={"displayModeBar": False}
+                use_container_width=True, config={"displayModeBar": False}
             )
 
 else:
@@ -2226,18 +1736,11 @@ else:
 # Footer
 st.markdown(f"""
 <div style="
-    margin-top:56px;
-    padding:22px 0;
+    margin-top:56px; padding:22px 0;
     border-top:1px solid {THEME['border']};
-    text-align:center;
-    color:{THEME['muted']};
-    font-family:'Inter',sans-serif;
-    font-size:11px;
-    font-weight:600;
-    letter-spacing:0.06em;
-    text-transform:uppercase;">
-  NEXUS 2ND AI MODEL v2.0 · Gradient Boosting · Walk-Forward OOS · MC Portfolio Forecast
+    text-align:center; color:{THEME['muted']};
+    font-family:'Inter',sans-serif; font-size:11px;
+    font-weight:600; letter-spacing:0.06em; text-transform:uppercase;">
+  NEXUS 2ND AI MODEL v2.1 · Gradient Boosting · Walk-Forward OOS · MC Portfolio Forecast
 </div>
 """, unsafe_allow_html=True)
-
-
