@@ -906,15 +906,28 @@ def chart_intraday(intra: pd.DataFrame, ticker: str, tdf: pd.DataFrame, sessions
     """
     fig = go.Figure()
 
+    # ── Y-Range dynamisch mit 5% Padding ────────────────────
+    y_min = float(intra["Close"].min())
+    y_max = float(intra["Close"].max())
+    y_pad = (y_max - y_min) * 0.05 if y_max > y_min else abs(y_min) * 0.02
+    y_lo = y_min - y_pad * 2
+    y_hi = y_max + y_pad
+
     # ── Linienchart (Close) ──────────────────────────────────
+    # Unsichtbare Basislinie bei y_lo für korrekten Fill
+    fig.add_trace(go.Scatter(
+        x=intra.index, y=[y_lo] * len(intra),
+        mode="lines", line=dict(width=0, color="rgba(0,0,0,0)"),
+        showlegend=False, hoverinfo="skip",
+    ))
     fig.add_trace(go.Scatter(
         x=intra.index,
         y=intra["Close"],
         mode="lines",
         name="Close",
         line=dict(color=THEME["accent1"], width=1.8),
-        fill="tozeroy",
-        fillcolor="rgba(200,169,107,0.08)",
+        fill="tonexty",
+        fillcolor="rgba(200,169,107,0.10)",
         hovertemplate="%{x|%d.%m %H:%M}  %{y:.2f}<extra></extra>",
     ))
 
@@ -959,8 +972,8 @@ def chart_intraday(intra: pd.DataFrame, ticker: str, tdf: pd.DataFrame, sessions
     # ── Rangebreaks: Wochenenden + Nacht (außerhalb 07:00-22:00) ──
     fig.update_xaxes(
         rangebreaks=[
-            dict(bounds=["sat", "mon"]),                    # Wochenenden
-            dict(bounds=[22, 7], pattern="hour"),           # Nacht
+            dict(bounds=["sat", "mon"]),
+            dict(bounds=[22, 7], pattern="hour"),
         ],
         tickformat="%H:%M",
         showgrid=True,
@@ -975,6 +988,7 @@ def chart_intraday(intra: pd.DataFrame, ticker: str, tdf: pd.DataFrame, sessions
         ),
         xaxis_rangeslider_visible=False,
         showlegend=True,
+        yaxis=dict(range=[y_lo, y_hi], tickformat=".2f"),
     )
     return fig
 
@@ -1744,3 +1758,4 @@ st.markdown(f"""
   NEXUS 2ND AI MODEL v2.1 · Gradient Boosting · Walk-Forward OOS · MC Portfolio Forecast
 </div>
 """, unsafe_allow_html=True)
+                                              
